@@ -5,8 +5,8 @@
   "description": "月子中心产妇护理计划与家属探访平台",
   "scripts": {
     "dev": "next dev -p 3000",
-    "build": "next build",
-    "start": "next start -p 3000",
+    "build": "next build && node scripts/copy-standalone.mjs",
+    "start": "HOSTNAME=0.0.0.0 node .next/standalone/server.js",
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {

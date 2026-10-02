@@ -25,6 +25,11 @@ export default async function NursePage() {
   const inStays = q(
     `SELECT s.id, s.mother_name, s.baby_name, s.jaundice_level, r.number FROM stays s
      JOIN rooms r ON r.id=s.room_id WHERE s.status='in_stay' ORDER BY r.number`);
+  const avoidances = q(
+    `SELECT na.*, r.number FROM nursing_avoidances na
+     JOIN stays s ON s.id=na.stay_id JOIN rooms r ON r.id=s.room_id
+     WHERE s.status='in_stay' AND na.status='planned'
+     ORDER BY na.window_start`);
 
   return (
     <AppShell title={user.role === "matron" ? "月嫂工作台" : "护理工作台"}>
@@ -33,6 +38,24 @@ export default async function NursePage() {
         <div className="stat"><div className="num">{myTasks.filter((t) => t.status === "done" && String(t.done_at || "").startsWith(todayStr)).length}</div><div className="label">今日已完成</div></div>
         <div className="stat"><div className="num">{inStays.length}</div><div className="label">在住房间</div></div>
       </div>
+
+      <Section title="探访护理避让（与门禁方案原子联动：查房/治疗改期请回填结果）" tone={avoidances.length ? "tone-amber" : ""}>
+        <DataTable cols={["房间", "避让窗口", "类型", "说明", "避让结果"]} empty="暂无待避让安排"
+          rows={avoidances.map((a) => [
+            <Link key="r" href={`/stays/${a.stay_id}`}>{String(a.number)}</Link>,
+            <span key="t" className="small">{String(a.window_start).slice(5, 16)} ~ {String(a.window_end).slice(11, 16)}</span>,
+            a.reason === "baby_care" ? <span key="y" className="badge amber">婴儿护理</span>
+              : a.reason === "rounds_shift" ? <span key="y" className="badge blue">护理改期</span>
+              : <span key="y" className="badge blue">探访避让</span>,
+            <span key="n" className="small">{String(a.note)}</span>,
+            <DataForm key="f" compact action="avoidances.update" hidden={{ id: Number(a.id) }}
+              fields={[
+                { name: "status", label: "结果", type: "select", required: true, options: [
+                  { value: "done", label: "已按方案避让" }, { value: "missed", label: "未能避让" }] },
+                { name: "result", label: "执行说明", placeholder: "如：查房提前至13:00完成" },
+              ]} submitLabel="回填" />,
+          ])} />
+      </Section>
 
       <Section title={isHeadNurse ? "全部护理任务" : "我的护理任务"}>
         <DataTable cols={["房间", "时间", "任务", "状态", "执行"]} empty="暂无任务"

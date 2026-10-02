@@ -39,7 +39,7 @@ export function DataForm(props: {
     setBusy(true);
     setMsg(null);
     const fd = new FormData(e.currentTarget);
-    const payload: Record<string, unknown> = { action: props.action, ...(props.hidden || {}) };
+    const payload: Record<string, unknown> = { __action: props.action, ...(props.hidden || {}) };
     for (const f of props.fields) {
       if (f.type === "checkbox") {
         payload[f.name] = fd.get(f.name) === "on";
@@ -115,7 +115,7 @@ export function ActionButton(props: {
     if (props.confirm && !window.confirm(props.confirm)) return;
     setBusy(true);
     try {
-      const r = await postDo({ action: props.action, ...(props.payload || {}) });
+      const r = await postDo({ __action: props.action, ...(props.payload || {}) });
       if (!r.ok) window.alert(r.error || "操作失败");
       else if (r.message) window.alert(r.message);
       router.refresh();

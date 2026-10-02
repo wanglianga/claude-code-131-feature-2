@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS rooms(
   number TEXT UNIQUE NOT NULL,
   type TEXT NOT NULL,
   floor TEXT DEFAULT '',
-  status TEXT DEFAULT 'vacant'
+  status TEXT DEFAULT 'vacant',
+  visitor_capacity INTEGER DEFAULT 2
 );
 CREATE TABLE IF NOT EXISTS packages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,7 +135,70 @@ CREATE TABLE IF NOT EXISTS visits(
   disinfection_note TEXT DEFAULT '',
   approved_by INTEGER,
   created_by INTEGER,
+  -- 授权关系：产妇授权单 id（未关联临时授权时为空）
+  authz_id INTEGER REFERENCES visit_authorizations(id),
+  priority_score INTEGER DEFAULT 0,
+  -- 健康/消毒前置条件
+  health_ok INTEGER DEFAULT 0,
+  health_note TEXT DEFAULT '',
+  health_checked_at TEXT,
+  -- 方案：排队 queue / 拆分时段 split / 改约 reschedule / 直接安排 direct
+  plan_decision TEXT DEFAULT '',
+  plan_detail TEXT DEFAULT '',
+  plan_generated_at TEXT,
+  plan_generated_by INTEGER,
+  -- 门禁：未获权限前不可入场
+  access_granted INTEGER DEFAULT 0,
+  access_granted_at TEXT,
+  access_token TEXT DEFAULT '',
+  entered_at TEXT,
+  left_at TEXT,
+  -- 爽约 / 闭环
+  no_show INTEGER DEFAULT 0,
+  no_show_reason TEXT DEFAULT '',
+  no_show_overridden INTEGER DEFAULT 0,
+  no_show_override_reason TEXT DEFAULT '',
+  no_show_override_by INTEGER,
+  no_show_override_at TEXT,
+  closed INTEGER DEFAULT 0,
+  closed_result TEXT DEFAULT '',
+  closed_at TEXT,
+  closed_by INTEGER,
   created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+-- 产妇对探访人的授权（含临时授权，须产妇书面/线上确认）
+CREATE TABLE IF NOT EXISTS visit_authorizations(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stay_id INTEGER NOT NULL REFERENCES stays(id),
+  visitor_name TEXT NOT NULL,
+  relation TEXT DEFAULT '',
+  kind TEXT DEFAULT 'routine',   -- routine 常规授权 / temp 临时授权
+  status TEXT DEFAULT 'pending', -- pending 待产妇确认 / active 生效 / revoked 已撤回 / expired 已过期
+  mother_confirmed INTEGER DEFAULT 0,
+  mother_confirmed_text TEXT DEFAULT '',
+  confirmed_at TEXT,
+  revoked_at TEXT,
+  revoke_reason TEXT DEFAULT '',
+  -- 撤回时是否仍有家属在场（已入场），需护士长升级协调
+  entered_on_revoke INTEGER DEFAULT 0,
+  escalated_head_nurse INTEGER DEFAULT 0,
+  escalated_note TEXT DEFAULT '',
+  created_by INTEGER,
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+-- 探访方案（一次冲突求解产生一个方案单；确认时原子落地）
+CREATE TABLE IF NOT EXISTS visit_plans(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stay_id INTEGER NOT NULL REFERENCES stays(id),
+  visit_date TEXT NOT NULL,
+  status TEXT DEFAULT 'proposed', -- proposed 已生成待确认 / confirmed 已确认 / rejected 已驳回（人工处理）
+  summary TEXT DEFAULT '',
+  blockers TEXT DEFAULT '[]',    -- 阻断项：临时授权未确认/健康异常/消毒未完成
+  created_by INTEGER,
+  created_at TEXT DEFAULT (datetime('now','localtime')),
+  confirmed_at TEXT,
+  confirmed_by INTEGER,
+  tx_status TEXT DEFAULT ''      -- 原子落地结果：access|avoidance|fail
 );
 CREATE TABLE IF NOT EXISTS fees(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -280,6 +344,48 @@ CREATE TABLE IF NOT EXISTS audit_logs(
   detail TEXT DEFAULT '',
   created_at TEXT DEFAULT (datetime('now','localtime'))
 );
+-- 门禁授权（方案确认后生成；撤回/爽约/闭环时失效）
+CREATE TABLE IF NOT EXISTS door_access(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stay_id INTEGER NOT NULL REFERENCES stays(id),
+  visit_id INTEGER NOT NULL REFERENCES visits(id),
+  visitor_name TEXT NOT NULL,
+  room_number TEXT DEFAULT '',
+  valid_from TEXT NOT NULL,
+  valid_to TEXT NOT NULL,
+  status TEXT DEFAULT 'active', -- active 有效 / entered 已入场 / used 已离场 / revoked 已失效 / expired 已过期
+  token TEXT DEFAULT '',
+  revoked_reason TEXT DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+-- 门禁进出记录
+CREATE TABLE IF NOT EXISTS door_events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  access_id INTEGER NOT NULL REFERENCES door_access(id),
+  stay_id INTEGER NOT NULL REFERENCES stays(id),
+  visit_id INTEGER NOT NULL REFERENCES visits(id),
+  visitor_name TEXT NOT NULL,
+  direction TEXT NOT NULL,      -- enter 入场 / exit 离场
+  event_at TEXT NOT NULL,
+  operator_name TEXT DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+-- 护士查房避让（方案确认时与门禁原子生成；护理端回填结果）
+CREATE TABLE IF NOT EXISTS nursing_avoidances(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stay_id INTEGER NOT NULL REFERENCES stays(id),
+  visit_id INTEGER REFERENCES visits(id),
+  plan_id INTEGER REFERENCES visit_plans(id),
+  reason TEXT DEFAULT 'visit',  -- visit 探访避让（消毒/查房/治疗由婴儿护理窗口固定占用）
+  window_start TEXT NOT NULL,
+  window_end TEXT NOT NULL,
+  note TEXT DEFAULT '',
+  status TEXT DEFAULT 'planned', -- planned 待避让 / done 已调整 / missed 未避让
+  result TEXT DEFAULT '',
+  handled_by INTEGER,
+  handled_at TEXT,
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
 `;
 
 type Row = Record<string, unknown>;
@@ -296,6 +402,7 @@ export function getDb(): DatabaseSync {
   db.exec("PRAGMA journal_mode=WAL;");
   db.exec("PRAGMA foreign_keys=ON;");
   db.exec(SCHEMA);
+  migrate(db);
   const cnt = db.prepare("SELECT COUNT(*) AS c FROM users").get() as Row;
   if (Number(cnt.c) === 0) {
     seed(db);
@@ -330,9 +437,50 @@ export function addDays(date: string, days: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
+function migrate(db: DatabaseSync) {
+  // 旧库补列（CREATE TABLE IF NOT EXISTS 不会更新已存在的表）
+  const columns = (table: string) =>
+    new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Row[]).map((c) => String(c.name)));
+  const addColumns = (table: string, defs: Record<string, string>) => {
+    const have = columns(table);
+    for (const [name, ddl] of Object.entries(defs)) {
+      if (!have.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${ddl}`);
+    }
+  };
+  addColumns("rooms", { visitor_capacity: "INTEGER DEFAULT 2" });
+  addColumns("visits", {
+    authz_id: "INTEGER",
+    priority_score: "INTEGER DEFAULT 0",
+    health_ok: "INTEGER DEFAULT 0",
+    health_note: "TEXT DEFAULT ''",
+    health_checked_at: "TEXT",
+    plan_decision: "TEXT DEFAULT ''",
+    plan_detail: "TEXT DEFAULT ''",
+    plan_generated_at: "TEXT",
+    plan_generated_by: "INTEGER",
+    access_granted: "INTEGER DEFAULT 0",
+    access_granted_at: "TEXT",
+    access_token: "TEXT DEFAULT ''",
+    entered_at: "TEXT",
+    left_at: "TEXT",
+    no_show: "INTEGER DEFAULT 0",
+    no_show_reason: "TEXT DEFAULT ''",
+    no_show_overridden: "INTEGER DEFAULT 0",
+    no_show_override_reason: "TEXT DEFAULT ''",
+    no_show_override_by: "INTEGER",
+    no_show_override_at: "TEXT",
+    closed: "INTEGER DEFAULT 0",
+    closed_result: "TEXT DEFAULT ''",
+    closed_at: "TEXT",
+    closed_by: "INTEGER",
+  });
+}
+
 function seed(db: DatabaseSync) {
   const ins = (sql: string, ...params: (string | number | null)[]) =>
     db.prepare(sql).run(...params);
+  const one = (sql: string, ...params: (string | number | null)[]) =>
+    db.prepare(sql).get(...params) as Row | undefined;
 
   // ---- 用户 ----
   const addUser = (username: string, password: string, name: string, role: string, phone = "") => {
@@ -489,9 +637,77 @@ function seed(db: DatabaseSync) {
     Number(ins(`INSERT INTO visits(stay_id,visitor_name,relation,visit_time,hours,is_temp,status,disinfected,disinfection_note,created_by)
       VALUES(?,?,?,?,?,?,?,?,?,?)`,
       stayId, name, relation, time, hours, isTemp, status, disinfected, note, family1).lastInsertRowid);
-  addVisit(stayA, "李秀兰", "婆婆", "2026-09-25 10:00", 2, 0, "completed", 1, "入所前手部消毒+测温正常");
-  addVisit(stayA, "张强", "丈夫", "2026-09-26 14:00", 3, 0, "approved");
-  addVisit(stayB, "刘洋", "丈夫", "2026-09-25 19:00", 2, 1, "pending");
+  const vLiDone = addVisit(stayA, "李秀兰", "婆婆", "2026-09-25 10:00", 2, 0, "completed", 1, "入所前手部消毒+测温正常");
+  const vZhangApproved = addVisit(stayA, "张强", "丈夫", "2026-09-26 14:00", 3, 0, "approved");
+  const vLiu = addVisit(stayB, "刘洋", "丈夫", "2026-09-25 19:00", 2, 1, "pending");
+
+  // ---- 产妇探访授权（常规/临时，临时授权须产妇确认）----
+  const addAuthz = (stayId: number, name: string, relation: string, kind: string, status: string,
+    text: string, confirmedAt: string | null, createdBy: number | null, revokedAt: string | null = null, reason = "") =>
+    Number(ins(`INSERT INTO visit_authorizations(stay_id,visitor_name,relation,kind,status,mother_confirmed,mother_confirmed_text,confirmed_at,created_by,revoked_at,revoke_reason)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+      stayId, name, relation, kind, status, status === "active" ? 1 : 0, text, confirmedAt, createdBy, revokedAt, reason).lastInsertRowid);
+  const azZhang = addAuthz(stayA, "张强", "丈夫", "routine", "active", "入住登记时产妇张丽书面授权", "2026-09-13 10:00:00", front);
+  const azLi = addAuthz(stayA, "李秀兰", "婆婆", "routine", "active", "入住登记时产妇张丽书面授权", "2026-09-13 10:00:00", front);
+  const azWang = addAuthz(stayA, "王梅", "表姐", "temp", "active", "张丽微信语音同意表姐10-02来访（家属端代为确认）", "2026-09-30 20:10:00", family1);
+  const azZhao = addAuthz(stayA, "赵磊", "朋友", "temp", "pending", "", null, family1);
+  const azLiu = addAuthz(stayB, "刘洋", "丈夫", "routine", "active", "入住登记时产妇刘敏书面授权", "2026-09-05 09:00:00", front);
+  ins("UPDATE visits SET authz_id=? WHERE id=?", azLiu, vLiu);
+  ins("UPDATE visits SET authz_id=? WHERE id=?", azZhang, vZhangApproved);
+
+  // 9-25 李秀兰探访：完整闭环（门禁进出 + 护理避让完成）
+  ins(`UPDATE visits SET authz_id=?,priority_score=150,health_ok=1,health_note='测温36.6℃，无呼吸道症状',health_checked_at='2026-09-25 09:55:00',
+    plan_decision='direct',plan_detail='原时段10:00-12:00安排，房间容量2人',access_granted=1,access_granted_at='2026-09-25 09:45:00',access_token='D-801-0925-LXL',
+    entered_at='2026-09-25 09:58:00',left_at='2026-09-25 11:50:00',closed=1,closed_result='门禁进出记录齐全；实际探访1人；护理避让已完成，预约闭环正常。',closed_at='2026-09-25 12:05:00',closed_by=?
+    WHERE id=?`, azLi, front, vLiDone);
+  ins(`INSERT INTO door_access(stay_id,visit_id,visitor_name,room_number,valid_from,valid_to,status,token,created_at)
+    VALUES(?,?,?,?,'2026-09-25 09:45:00','2026-09-25 12:15:00','used','D-801-0925-LXL','2026-09-25 09:45:00')`, stayA, vLiDone, "李秀兰", "801");
+  const accLi = one("SELECT id FROM door_access WHERE visit_id=?", vLiDone)!;
+  ins(`INSERT INTO door_events(access_id,stay_id,visit_id,visitor_name,direction,event_at,operator_name,created_at)
+    VALUES(?,?,?,?,'enter','2026-09-25 09:58:00','小钱（前台）','2026-09-25 09:58:00')`, Number(accLi.id), stayA, vLiDone, "李秀兰");
+  ins(`INSERT INTO door_events(access_id,stay_id,visit_id,visitor_name,direction,event_at,operator_name,created_at)
+    VALUES(?,?,?,?,'exit','2026-09-25 11:50:00','小钱（前台）','2026-09-25 11:50:00')`, Number(accLi.id), stayA, vLiDone, "李秀兰");
+  ins(`INSERT INTO nursing_avoidances(stay_id,visit_id,reason,window_start,window_end,note,status,result,handled_by,handled_at)
+    VALUES(?,?, 'visit','2026-09-25 10:00:00','2026-09-25 12:00:00','李秀兰探访，查房/治疗避让','done','晨间治疗与查房提前至09:00完成，探访时段无护理动作进入房间。',?, '2026-09-25 09:40:00')`,
+    stayA, vLiDone, nurse1);
+
+  // 9-22 李秀兰爽约历史（影响后续排队优先级）
+  const vLiNoShow = addVisit(stayA, "李秀兰", "婆婆", "2026-09-22 14:00", 2, 0, "no_show", 1, "");
+  ins(`UPDATE visits SET authz_id=?,priority_score=100,health_ok=1,health_note='测温正常',health_checked_at='2026-09-22 13:50:00',
+    plan_decision='direct',access_granted=1,access_granted_at='2026-09-22 13:45:00',access_token='D-801-0922-LXL',
+    no_show=1,no_show_reason='超过预约时间30分钟未到场，电话联系家属确认放弃',
+    closed=1,closed_result='爽约记录1次（未获覆盖），后续90天内排队优先级下调；门禁全程无进出记录。',closed_at='2026-09-22 14:35:00',closed_by=?
+    WHERE id=?`, azLi, front, vLiNoShow);
+  ins(`INSERT INTO door_access(stay_id,visit_id,visitor_name,room_number,valid_from,valid_to,status,token,revoked_reason,created_at)
+    VALUES(?,?,?,?,'2026-09-22 13:45:00','2026-09-22 16:15:00','expired','D-801-0922-LXL','爽约未入场，权限到期失效','2026-09-22 13:45:00')`,
+    stayA, vLiNoShow, "李秀兰", "801");
+
+  // ---- 10-02 探访冲突群（801 容量2人，4份申请争夺同一时段）----
+  const vOctZhang = addVisit(stayA, "张强", "丈夫", "2026-10-02 14:00", 2, 0, "pending");
+  const vOctLi = addVisit(stayA, "李秀兰", "婆婆", "2026-10-02 14:00", 2, 0, "pending");
+  const vOctWang = addVisit(stayA, "王梅", "表姐", "2026-10-02 14:00", 2, 1, "pending");
+  const vOctZhao = addVisit(stayA, "赵磊", "朋友", "2026-10-02 14:00", 2, 1, "pending");
+  ins("UPDATE visits SET authz_id=? WHERE id=?", azZhang, vOctZhang);
+  ins("UPDATE visits SET authz_id=? WHERE id=?", azLi, vOctLi);
+  ins("UPDATE visits SET authz_id=? WHERE id=?", azWang, vOctWang);
+  ins("UPDATE visits SET authz_id=? WHERE id=?", azZhao, vOctZhao);
+  // 前三份前置条件齐备（健康核验+消毒完成）；赵磊临时授权未确认、健康异常且未消毒 → 必须阻断
+  ins("UPDATE visits SET health_ok=1,health_note='测温36.5℃，无呼吸道症状',health_checked_at='2026-10-02 09:40:00',disinfected=1,disinfection_note='手部消毒+更衣，测温正常' WHERE id=?", vOctZhang);
+  ins("UPDATE visits SET health_ok=1,health_note='测温36.7℃，无呼吸道症状',health_checked_at='2026-10-02 09:42:00',disinfected=1,disinfection_note='手部消毒+测温正常' WHERE id=?", vOctLi);
+  ins("UPDATE visits SET health_ok=1,health_note='测温36.6℃，无异常',health_checked_at='2026-10-02 09:45:00',disinfected=1,disinfection_note='手部消毒+测温正常' WHERE id=?", vOctWang);
+  ins("UPDATE visits SET health_ok=0,health_note='体温37.8℃，伴轻微咳嗽' WHERE id=?", vOctZhao);
+
+  // 固定护理避让窗口 / 婴儿护理安排（方案生成时作为硬约束）
+  ins(`INSERT INTO nursing_avoidances(stay_id,reason,window_start,window_end,note,status)
+    VALUES(?,'baby_care','2026-10-02 16:00:00','2026-10-02 17:00:00','宝宝洗澡抚触+臀部护理，房间需清空探访人员','planned')`, stayA);
+  ins(`INSERT INTO nursing_avoidances(stay_id,reason,window_start,window_end,note,status)
+    VALUES(?,'rounds','2026-10-02 20:30:00','2026-10-02 21:00:00','晚间查房与生命体征监测','planned')`, stayA);
+  // 与探访时段冲突的待执行护理任务（方案确认时原子改期避让）
+  const insVisitTask = (stayId: number, type: string, title: string, at: string, assignee: number) =>
+    Number(ins("INSERT INTO care_tasks(stay_id,plan_id,type,title,scheduled_at,assignee_id,status) VALUES(?,?,?,?,?,?,'pending')",
+      stayId, null, type, title, at, assignee).lastInsertRowid);
+  insVisitTask(stayA, "wound", "伤口观察（剖宫产）", "2026-10-02 14:30", nurse1);
+  insVisitTask(stayA, "rounds", "晚间查房", "2026-10-02 20:30", nurse1);
 
   // ---- 费用 ----
   const addFee = (stayId: number, type: string, amount: number, desc: string, direction = "charge", by: number = finance, at: string | null = null) =>

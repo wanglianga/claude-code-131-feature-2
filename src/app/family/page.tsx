@@ -2,8 +2,11 @@ import { redirect } from "next/navigation";
 import { q, q1 } from "@/lib/db";
 import { requireUser } from "@/lib/guard";
 import { AppShell, Section, DataTable, KV, Badge } from "@/components/ui";
-import { DataForm } from "@/components/client";
-import { PLAN_TYPES, VISIT_STATUS, FEE_TYPES, money, dt, badgeClass } from "@/lib/labels";
+import { DataForm, ActionButton } from "@/components/client";
+import {
+  PLAN_TYPES, VISIT_STATUS, FEE_TYPES, AUTHZ_KIND, AUTHZ_STATUS, DOOR_STATUS,
+  PLAN_DECISION, money, dt, badgeClass,
+} from "@/lib/labels";
 
 export const dynamic = "force-dynamic";
 
@@ -35,6 +38,12 @@ export default async function FamilyPage() {
          WHERE t.stay_id=? AND t.visible_to_family=1 AND t.status='done' ORDER BY t.done_at DESC LIMIT 10`, stayId)
     : [];
   const visits = showVisits ? q("SELECT * FROM visits WHERE stay_id=? ORDER BY visit_time DESC LIMIT 10", stayId) : [];
+  const authorizations = showVisits
+    ? q("SELECT * FROM visit_authorizations WHERE stay_id=? ORDER BY status='active' DESC, id DESC", stayId)
+    : [];
+  const doorEvents = showVisits
+    ? q(`SELECT de.* FROM door_events de WHERE de.stay_id=? ORDER BY de.event_at DESC LIMIT 8`, stayId)
+    : [];
   const fees = showFees ? q("SELECT * FROM fees WHERE stay_id=? AND status='confirmed' ORDER BY created_at", stayId) : [];
   const settlement = showFees ? q1("SELECT * FROM settlements WHERE stay_id=?", stayId) : undefined;
   const feedbacks = q("SELECT * FROM feedbacks WHERE stay_id=? ORDER BY created_at DESC LIMIT 10", stayId);
@@ -97,29 +106,91 @@ export default async function FamilyPage() {
         </div>
       )}
 
-      <div className="grid cols-2">
+      <div>
         {showVisits && (
-          <Section title="探访预约">
-            <DataForm compact action="visits.create" hidden={{ stayId }}
-              fields={[
-                { name: "visitorName", label: "探访人姓名", required: true },
-                { name: "relation", label: "与产妇关系", placeholder: "如：丈夫 / 婆婆" },
-                { name: "visitTime", label: "探访时间", type: "datetime-local", required: true },
-                { name: "hours", label: "时长(小时)", type: "number", defaultValue: 2 },
-                { name: "isTemp", label: "临时增加探访", type: "checkbox" },
-              ]} submitLabel="提交预约" />
-            <div className="mt8">
-              <DataTable cols={["探访人", "时间", "状态", "消毒"]} empty="暂无预约"
-                rows={visits.map((v) => [
-                  <span key="v">{String(v.visitor_name)}{Number(v.is_temp) ? <span className="badge amber">临时</span> : null}</span>,
-                  <span key="t" className="small">{dt(v.visit_time)}</span>,
-                  <Badge key="s" text={VISIT_STATUS[String(v.status)] || ""} cls={badgeClass(String(v.status))} />,
-                  Number(v.disinfected) ? <span key="d" className="badge green">已消毒</span> : <span key="nd" className="badge gray">待入所登记</span>,
-                ])} />
+          <Section title="探访授权与预约（授权经产妇确认后方可排期）">
+            <div className="muted small mb8">
+              常规授权入住时由产妇书面登记；临时来访（朋友/亲戚）须先登记临时授权并由产妇书面/线上确认。
+              产妇可在探访前随时撤回：未入场家属门禁立即失效并通知前台；已入场的撤回将升级护士长现场协调。
+            </div>
+            <DataTable cols={["探访人", "关系", "类型", "状态", "产妇确认", "操作"]} empty="暂无授权"
+              rows={authorizations.map((a) => [
+                String(a.visitor_name), String(a.relation || "-"),
+                AUTHZ_KIND[String(a.kind)] || String(a.kind),
+                <Badge key="s" text={AUTHZ_STATUS[String(a.status)] || String(a.status)} cls={badgeClass(String(a.status === "active" ? "approved" : a.status === "pending" ? "processing" : "cancelled"))} />,
+                <span key="c" className="small">{a.mother_confirmed_text ? String(a.mother_confirmed_text) : "—"}{a.revoke_reason ? <div className="badge gray">撤回：{String(a.revoke_reason)}</div> : null}{Number(a.escalated_head_nurse) ? <div className="badge red">撤回时在场·护士长协调中</div> : null}</span>,
+                a.status === "pending" ? (
+                  <DataForm key="cf" compact action="authz.confirm" hidden={{ id: Number(a.id) }}
+                    fields={[{ name: "motherConfirmText", label: "产妇书面确认", required: true, placeholder: "如：产妇张丽微信确认同意来访" }]}
+                    submitLabel="产妇确认生效" />
+                ) : a.status === "active" ? (
+                  <DataForm key="rv" compact action="authz.revoke" hidden={{ id: Number(a.id) }}
+                    fields={[{ name: "reason", label: "撤回原因", required: true }]}
+                    submitLabel="撤回授权" />
+                ) : <span key="x" className="small muted">{dt(a.revoked_at || a.confirmed_at)}</span>,
+              ])} />
+            <details className="mt8">
+              <summary className="muted">登记新的探访授权</summary>
+              <DataForm compact action="authz.create" hidden={{ stayId }}
+                fields={[
+                  { name: "visitorName", label: "探访人姓名", required: true },
+                  { name: "relation", label: "与产妇关系", placeholder: "如：朋友 / 表姐" },
+                  { name: "kind", label: "授权类型", type: "select", required: true, options: [
+                    { value: "routine", label: "常规授权（长期）" }, { value: "temp", label: "临时授权（单次）" }] },
+                ]} submitLabel="登记（随后需产妇确认）" />
+            </details>
+
+            <div className="mt16">
+              <DataForm compact action="visits.create" hidden={{ stayId }}
+                fields={[
+                  { name: "visitorName", label: "探访人姓名", required: true },
+                  { name: "relation", label: "与产妇关系", placeholder: "如：丈夫 / 婆婆" },
+                  { name: "visitTime", label: "探访时间", type: "datetime-local", required: true },
+                  { name: "hours", label: "时长(小时)", type: "number", defaultValue: 2 },
+                  { name: "isTemp", label: "临时增加探访", type: "checkbox" },
+                ]} submitLabel="提交预约" />
             </div>
           </Section>
         )}
+      </div>
 
+      {showVisits && (
+        <Section title="我的探访排期与门禁状态">
+          <DataTable cols={["探访人", "时间", "状态", "方案", "门禁", "闭环结果"]} empty="暂无预约"
+            rows={visits.map((v) => {
+              let d: { assigned?: { start: string; end: string } | null; blockers?: string[] } = {};
+              try { d = JSON.parse(String(v.plan_detail || "{}")); } catch { /* ignore */ }
+              return [
+                <span key="v">{String(v.visitor_name)}{Number(v.is_temp) ? <span className="badge amber">临时</span> : null}</span>,
+                <span key="t" className="small">{dt(v.visit_time)}</span>,
+                <span key="s">
+                  <Badge text={VISIT_STATUS[String(v.status)] || ""} cls={badgeClass(String(v.status))} />
+                  {Number(v.no_show) === 1 && <span className="badge red">爽约{Number(v.no_show_overridden) ? "（已覆盖）" : ""}</span>}
+                </span>,
+                <span key="p" className="small">
+                  {v.plan_decision ? <Badge text={PLAN_DECISION[String(v.plan_decision)] || String(v.plan_decision)} cls={v.plan_decision === "blocked" || v.plan_decision === "queue" ? "badge red" : "badge blue"} /> : "待排期"}
+                  {d.assigned ? <div>{d.assigned.start.slice(11)}-{d.assigned.end.slice(11)}</div> : null}
+                  {d.blockers?.length ? <div className="badge red">{d.blockers.join("、")}</div> : null}
+                </span>,
+                <span key="g" className="small">
+                  {Number(v.access_granted)
+                    ? <><Badge text={v.entered_at ? (v.left_at ? "已离场" : "在场") : "门禁有效"} cls={v.left_at ? "badge gray" : "badge green"} /><div>凭证 {String(v.access_token)}</div></>
+                    : <span className="muted">未下发</span>}
+                </span>,
+                <span key="c" className="small">{Number(v.closed) ? String(v.closed_result) : "活动结束后判定"}</span>,
+              ];
+            })} />
+          <div className="muted small mt8">最近门禁进出记录：</div>
+          <DataTable cols={["时间", "探访人", "方向", "前台操作人"]} empty="暂无进出记录"
+            rows={doorEvents.map((e) => [
+              dt(e.event_at), String(e.visitor_name),
+              String(e.direction) === "enter" ? <span key="d" className="badge green">入场</span> : <span key="d" className="badge gray">离场</span>,
+              String(e.operator_name || "-"),
+            ])} />
+        </Section>
+      )}
+
+      <div className="grid cols-2">
         {showFees && (
           <Section title="费用明细">
             <DataTable cols={["时间", "项目", "方向", "金额"]} empty="暂无费用"

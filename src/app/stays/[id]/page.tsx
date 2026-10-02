@@ -6,6 +6,7 @@ import { AppShell, Section, DataTable, KV, Badge } from "@/components/ui";
 import { DataForm, ActionButton } from "@/components/client";
 import {
   PLAN_TYPES, EX_TYPES, EX_STATUS, SEVERITY, FEE_TYPES, TASK_STATUS, VISIT_STATUS,
+  AUTHZ_KIND, AUTHZ_STATUS, PLAN_DECISION, PLAN_STATUS, DOOR_STATUS, AVOID_STATUS,
   money, dt, badgeClass, severityClass,
 } from "@/lib/labels";
 
@@ -27,7 +28,13 @@ export default async function StayPage({ params }: { params: Promise<{ id: strin
                    WHERE t.stay_id=? ORDER BY t.scheduled_at DESC LIMIT 30`, stayId);
   const records = q("SELECT * FROM care_records WHERE stay_id=? ORDER BY created_at DESC LIMIT 30", stayId);
   const meals = q("SELECT * FROM meals WHERE stay_id=? ORDER BY meal_date DESC, id DESC LIMIT 15", stayId);
-  const visits = q("SELECT * FROM visits WHERE stay_id=? ORDER BY visit_time DESC LIMIT 15", stayId);
+  const visits = q("SELECT * FROM visits WHERE stay_id=? ORDER BY visit_time DESC LIMIT 20", stayId);
+  const authorizations = q("SELECT * FROM visit_authorizations WHERE stay_id=? ORDER BY id DESC", stayId);
+  const visitPlans = q("SELECT * FROM visit_plans WHERE stay_id=? ORDER BY id DESC LIMIT 5", stayId);
+  const doorAccesses = q(
+    `SELECT da.* FROM door_access da WHERE da.stay_id=? ORDER BY da.id DESC LIMIT 15`, stayId);
+  const doorEvents = q("SELECT * FROM door_events WHERE stay_id=? ORDER BY event_at DESC LIMIT 15", stayId);
+  const avoidances = q("SELECT * FROM nursing_avoidances WHERE stay_id=? ORDER BY window_start DESC LIMIT 20", stayId);
   const hosting = q("SELECT * FROM hosting_logs WHERE stay_id=? ORDER BY start_time DESC LIMIT 15", stayId);
   const rounds = q("SELECT * FROM doctor_rounds WHERE stay_id=? ORDER BY round_date DESC LIMIT 10", stayId);
   const schedules = q(`SELECT ts.*, u.name AS therapist FROM therapist_schedules ts LEFT JOIN users u ON u.id=ts.therapist_id
@@ -213,29 +220,133 @@ export default async function StayPage({ params }: { params: Promise<{ id: strin
         </Section>
 
         {/* 探访管理 */}
-        <Section title="家属探访（含消毒登记）">
-          <DataTable cols={["探访人", "时间", "时长", "状态", "消毒", "操作"]} empty="暂无探访"
-            rows={visits.map((v) => [
-              <span key="a">{String(v.visitor_name)}<span className="muted small">（{String(v.relation)}）</span>{Number(v.is_temp) ? <span className="badge amber">临时</span> : null}</span>,
-              <span key="b" className="small">{dt(v.visit_time)}</span>,
-              `${v.hours}小时`,
-              <Badge key="c" text={VISIT_STATUS[String(v.status)] || String(v.status)} cls={badgeClass(String(v.status))} />,
-              Number(v.disinfected) ? <span key="d" className="badge green">已消毒</span> : <span key="d2" className="badge gray">未登记</span>,
-              can(user, ["frontdesk", "head_nurse", "admin"]) ? (
-                <span key="ops" className="row">
-                  {v.status === "pending" && <>
-                    <ActionButton action="visits.update" payload={{ id: Number(v.id), action: "approve" }} label="批准" kind="primary" />
-                    <ActionButton action="visits.update" payload={{ id: Number(v.id), action: "reject" }} label="拒绝" kind="danger" />
-                  </>}
-                  {v.status === "approved" && !Number(v.disinfected) &&
-                    <ActionButton action="visits.update" payload={{ id: Number(v.id), action: "disinfect" }} label="消毒登记" />}
-                  {v.status === "approved" &&
-                    <ActionButton action="visits.update" payload={{ id: Number(v.id), action: "complete" }} label="完成探访" />}
-                </span>
-              ) : <span key="x" className="muted small">-</span>,
-            ])} />
+        <Section title="家属探访 · 授权/健康/门禁/闭环">
+          <DataTable cols={["探访人", "时间", "状态", "授权", "健康/消毒", "方案/门禁", "闭环", "操作"]} empty="暂无探访"
+            rows={visits.map((v) => {
+              let d: { assigned?: { start: string; end: string } | null; blockers?: string[] } = {};
+              try { d = JSON.parse(String(v.plan_detail || "{}")); } catch { /* ignore */ }
+              return [
+                <span key="a">{String(v.visitor_name)}<span className="muted small">（{String(v.relation)}）</span>{Number(v.is_temp) ? <span className="badge amber">临时</span> : null}</span>,
+                <span key="b" className="small">{dt(v.visit_time)}<div className="muted">优先级 {String(v.priority_score)}</div></span>,
+                <span key="c"><Badge text={VISIT_STATUS[String(v.status)] || String(v.status)} cls={badgeClass(String(v.status))} />{Number(v.no_show) ? <span className="badge red">爽约{Number(v.no_show_overridden) ? "·已覆盖" : ""}</span> : null}</span>,
+                v.authz_id ? <span key="az" className="small">{AUTHZ_KIND[String((authorizations.find((a) => Number(a.id) === Number(v.authz_id)) || {}).kind || "")] || "授权"}</span> : <span key="az" className="badge red">无</span>,
+                <span key="hd" className="small">{Number(v.health_ok) ? "健康✓" : <b className="badge red">健康×</b>}<div>{Number(v.disinfected) ? "消毒✓" : <span className="badge amber">消毒×</span>}</div></span>,
+                <span key="p" className="small">
+                  {v.plan_decision ? <Badge text={PLAN_DECISION[String(v.plan_decision)] || String(v.plan_decision)} cls={["blocked", "queue"].includes(String(v.plan_decision)) ? "badge red" : "badge blue"} /> : "-"}
+                  {d.blockers?.length ? <div className="badge red">{d.blockers.join("、")}</div> : null}
+                  {Number(v.access_granted) ? <div className="badge green">门禁{String(v.access_token)}</div> : null}
+                </span>,
+                Number(v.closed) ? <span key="cl" className="small">{/不配对|未避让/.test(String(v.closed_result)) ? <span className="badge red">异常</span> : <span className="badge green">正常</span>}<div className="muted">{String(v.closed_result)}</div></span> : <span key="cl" className="muted small">未闭环</span>,
+                can(user, ["frontdesk", "head_nurse", "nurse", "admin"]) ? (
+                  <span key="ops" className="row">
+                    {Number(v.health_ok) === 0 && (
+                      <DataForm compact action="visits.healthCheck" hidden={{ id: Number(v.id) }}
+                        fields={[
+                          { name: "healthOk", label: "健康", type: "select", required: true, options: [{ value: "1", label: "通过" }, { value: "0", label: "异常" }] },
+                          { name: "healthNote", label: "说明" },
+                        ]} submitLabel="核验" />
+                    )}
+                    {Number(v.access_granted) === 0 && Number(v.health_ok) === 1 && Number(v.disinfected) === 0 &&
+                      <ActionButton action="visits.update" payload={{ id: Number(v.id), action: "disinfect" }} label="消毒登记" />}
+                    {!v.entered_at && v.status === "approved" && Number(v.access_granted) === 0 &&
+                      <ActionButton action="visits.update" payload={{ id: Number(v.id), action: "reject" }} label="拒绝" kind="danger" />}
+                    {Number(v.access_granted) === 1 && !v.entered_at && <ActionButton action="door.enter" payload={{ visitId: Number(v.id) }} label="入场" kind="primary" />}
+                    {Boolean(v.entered_at) && !v.left_at && <ActionButton action="door.exit" payload={{ visitId: Number(v.id) }} label="离场" />}
+                    {Boolean(v.left_at) && Number(v.closed) === 0 && <ActionButton action="visits.closeLoop" payload={{ id: Number(v.id) }} label="闭环判定" kind="primary" />}
+                    {v.status !== "no_show" && !v.entered_at && Number(v.access_granted) === 1 && (
+                      <DataForm compact action="visits.markNoShow" hidden={{ id: Number(v.id) }}
+                        fields={[{ name: "reason", label: "爽约说明", required: true }]} submitLabel="爽约" />
+                    )}
+                    {Number(v.no_show) === 1 && Number(v.no_show_overridden) === 0 && can(user, ["frontdesk", "head_nurse", "admin"]) && (
+                      <DataForm compact action="visits.overrideNoShow" hidden={{ id: Number(v.id) }}
+                        fields={[
+                          { name: "basis", label: "依据", type: "select", required: true, options: [
+                            { value: "emergency", label: "紧急照护" }, { value: "mother_written", label: "产妇书面确认" }] },
+                          { name: "reason", label: "理由", required: true },
+                        ]} submitLabel="覆盖" />
+                    )}
+                    {Number(v.closed) === 1 && /不配对|未避让/.test(String(v.closed_result)) && can(user, ["head_nurse", "admin"]) && (
+                      <DataForm compact action="visits.forceClose" hidden={{ id: Number(v.id) }}
+                        fields={[{ name: "note", label: "核销说明", required: true }]} submitLabel="人工核销" />
+                    )}
+                  </span>
+                ) : <span key="x" className="muted small">-</span>,
+              ];
+            })} />
         </Section>
       </div>
+
+      {/* 探访协同方案 + 授权名单 */}
+      {inStay && can(user, ["frontdesk", "head_nurse", "nurse", "admin"]) && (
+        <div className="grid cols-2">
+          <Section title="探访冲突协同方案" tone={visitPlans.some((p) => p.status === "proposed") ? "tone-amber" : ""}>
+            {inStay && can(user, ["frontdesk", "head_nurse", "admin"]) && (
+              <DataForm compact action="visits.generatePlan" hidden={{ stayId }}
+                fields={[{ name: "date", label: "探访日期", type: "date", required: true }]}
+                submitLabel="生成当日方案" />
+            )}
+            <DataTable cols={["日期", "方案", "状态", "操作"]} empty="暂无方案"
+              rows={visitPlans.map((p) => [
+                String(p.visit_date),
+                <span key="s" className="small" style={{ whiteSpace: "pre-line" }}>{String(p.summary)}</span>,
+                <Badge key="b" text={PLAN_STATUS[String(p.status)] || String(p.status)} cls={p.status === "proposed" ? "badge amber" : p.status === "confirmed" ? "badge green" : "badge gray"} />,
+                p.status === "proposed" && can(user, ["frontdesk", "head_nurse", "admin"]) ? (
+                  <span key="ops" className="row">
+                    <ActionButton action="visits.confirmPlan" payload={{ planId: Number(p.id) }} label="确认下发" kind="primary" />
+                    <ActionButton action="visits.rejectPlan" payload={{ planId: Number(p.id) }} label="驳回" kind="danger" />
+                  </span>
+                ) : <span key="x" className="small muted">{String(p.tx_status || "")}</span>,
+              ])} />
+          </Section>
+
+          <Section title="产妇探访授权名单">
+            <DataTable cols={["探访人", "关系", "类型", "状态", "产妇确认/撤回"]} empty="暂无授权"
+              rows={authorizations.map((a) => [
+                String(a.visitor_name), String(a.relation || "-"),
+                AUTHZ_KIND[String(a.kind)] || String(a.kind),
+                <Badge key="s" text={AUTHZ_STATUS[String(a.status)] || String(a.status)} cls={a.status === "active" ? "badge green" : a.status === "pending" ? "badge amber" : "badge gray"} />,
+                <span key="c" className="small">{String(a.mother_confirmed_text || "-")}{Number(a.escalated_head_nurse) ? <div className="badge red">撤回时在场·升级护士长</div> : null}{a.revoke_reason ? <div className="muted">撤回：{String(a.revoke_reason)}</div> : null}</span>,
+              ])} />
+          </Section>
+        </div>
+      )}
+
+      {/* 门禁记录 + 护理避让 */}
+      {can(user, ["frontdesk", "head_nurse", "nurse", "admin"]) && (
+        <div className="grid cols-2">
+          <Section title="门禁授权与进出记录">
+            <DataTable cols={["探访人", "有效期", "凭证", "状态", "进出"]} empty="暂无门禁"
+              rows={doorAccesses.map((da) => {
+                const evs = doorEvents.filter((e) => Number(e.access_id) === Number(da.id));
+                return [
+                  String(da.visitor_name),
+                  <span key="t" className="small">{String(da.valid_from).slice(5, 16)} ~ {String(da.valid_to).slice(11, 16)}</span>,
+                  <span key="tk" className="small">{String(da.token)}</span>,
+                  <Badge key="s" text={DOOR_STATUS[String(da.status)] || String(da.status)} cls={badgeClass(String(da.status))} />,
+                  <span key="e" className="small">{evs.map((e) => `${String(e.direction) === "enter" ? "进" : "出"} ${String(e.event_at).slice(11, 16)}`).join(" / ") || "-"}{da.revoked_reason ? <div className="muted">{String(da.revoked_reason)}</div> : null}</span>,
+                ];
+              })} />
+          </Section>
+
+          <Section title="护士查房避让结果（闭环依据之一）">
+            <DataTable cols={["窗口", "类型", "说明", "状态", "结果回填"]} empty="暂无避让安排"
+              rows={avoidances.map((a) => [
+                <span key="t" className="small">{String(a.window_start).slice(5, 16)}~{String(a.window_end).slice(11, 16)}</span>,
+                a.reason === "baby_care" ? "婴儿护理" : a.reason === "rounds_shift" ? "护理改期" : "探访避让",
+                <span key="n" className="small">{String(a.note)}</span>,
+                <Badge key="s" text={AVOID_STATUS[String(a.status)] || String(a.status)} cls={a.status === "done" ? "badge green" : a.status === "missed" ? "badge red" : "badge amber"} />,
+                a.status === "planned" && can(user, ["nurse", "matron", "head_nurse", "admin"]) ? (
+                  <DataForm key="f" compact action="avoidances.update" hidden={{ id: Number(a.id) }}
+                    fields={[
+                      { name: "status", label: "结果", type: "select", required: true, options: [
+                        { value: "done", label: "已避让" }, { value: "missed", label: "未避让" }] },
+                      { name: "result", label: "说明" },
+                    ]} submitLabel="回填" />
+                ) : <span key="r" className="small muted">{String(a.result || "-")}</span>,
+              ])} />
+          </Section>
+        </div>
+      )}
 
       <div className="grid cols-2">
         {/* 宝宝托管 */}

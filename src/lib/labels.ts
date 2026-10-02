@@ -47,6 +47,47 @@ export const EX_TYPES: Record<string, string> = {
   early_checkout: "提前退所",
   record_dispute: "家属质疑护理记录",
   checkout_dispute: "退所争议",
+  visit_authz_revoke: "撤回授权时探访人在场",
+};
+
+export const AUTHZ_KIND: Record<string, string> = {
+  routine: "常规授权",
+  temp: "临时授权",
+};
+
+export const AUTHZ_STATUS: Record<string, string> = {
+  pending: "待产妇确认",
+  active: "已生效",
+  revoked: "已撤回",
+  expired: "已过期",
+};
+
+export const PLAN_DECISION: Record<string, string> = {
+  direct: "原时段安排",
+  split: "拆分时段",
+  reschedule: "改约",
+  queue: "排队等候",
+  blocked: "阻断·人工处理",
+};
+
+export const PLAN_STATUS: Record<string, string> = {
+  proposed: "待前台确认",
+  confirmed: "已确认并下发",
+  rejected: "已驳回",
+};
+
+export const DOOR_STATUS: Record<string, string> = {
+  active: "门禁有效",
+  entered: "已入场",
+  used: "已离场",
+  revoked: "已失效",
+  expired: "已过期",
+};
+
+export const AVOID_STATUS: Record<string, string> = {
+  planned: "待避让",
+  done: "已避让",
+  missed: "未避让",
 };
 
 export const FEE_TYPES: Record<string, string> = {
@@ -81,10 +122,12 @@ export const TASK_STATUS: Record<string, string> = {
 
 export const VISIT_STATUS: Record<string, string> = {
   pending: "待审核",
-  approved: "已批准",
+  approved: "已批准/已排定",
+  scheduled: "已排期",
   rejected: "已拒绝",
   completed: "已完成",
   cancelled: "已取消",
+  no_show: "爽约",
 };
 
 export function money(n: unknown): string {
@@ -102,8 +145,9 @@ export function badgeClass(status: string): string {
     case "open": case "pending": case "issue": case "new": return "badge red";
     case "processing": case "planned": case "scheduled": case "following": case "draft": return "badge amber";
     case "resolved": case "done": case "confirmed": case "approved": case "delivered": case "responded": case "converted": return "badge green";
-    case "closed": case "cancelled": case "void": case "rejected": case "lost": return "badge gray";
-    case "completed": case "active": case "in_stay": return "badge blue";
+    case "closed": case "cancelled": case "void": case "rejected": case "lost": case "revoked": case "expired": return "badge gray";
+    case "completed": case "active": case "entered": case "in_stay": return "badge blue";
+    case "no_show": case "missed": return "badge red";
     case "checked_out": return "badge gray";
     default: return "badge gray";
   }
