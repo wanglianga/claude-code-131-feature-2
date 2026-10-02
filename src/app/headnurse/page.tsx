@@ -3,7 +3,7 @@ import { q } from "@/lib/db";
 import { requireUser } from "@/lib/guard";
 import { AppShell, Section, DataTable, Badge } from "@/components/ui";
 import { DataForm } from "@/components/client";
-import { EX_TYPES, EX_STATUS, SEVERITY, dt, badgeClass, severityClass } from "@/lib/labels";
+import { EX_TYPES, EX_STATUS, SEVERITY, AUTH_STATUS, dt, badgeClass, severityClass } from "@/lib/labels";
 
 export const dynamic = "force-dynamic";
 
@@ -33,6 +33,16 @@ export default async function HeadNursePage() {
     `SELECT f.*, r.number, s.mother_name FROM follow_ups f
      JOIN stays s ON s.id=f.stay_id JOIN rooms r ON r.id=s.room_id
      WHERE f.status='pending' ORDER BY f.scheduled_at LIMIT 10`);
+  // 产妇撤回授权但访客已在场 —— 待护士长协调
+  const escalations = q(
+    `SELECT a.*, r.number FROM visit_authorizations a
+     JOIN stays s ON s.id=a.stay_id JOIN rooms r ON r.id=s.room_id
+     WHERE a.status='revoking' ORDER BY a.entered_at_revoke DESC`);
+  // 探访护理避让待确认（全中心今日）
+  const avoidPending = q(
+    `SELECT ca.*, r.number FROM care_avoidances ca
+     JOIN stays s ON s.id=ca.stay_id JOIN rooms r ON r.id=s.room_id
+     WHERE ca.status='planned' ORDER BY ca.window_start LIMIT 20`);
 
   return (
     <AppShell title="护士长工作台">
@@ -42,6 +52,34 @@ export default async function HeadNursePage() {
         <div className="stat"><div className="num">{feedbacks.filter((f) => f.status === "new").length}</div><div className="label">待回复家属反馈</div></div>
         <div className="stat"><div className="num">{leaves.length}</div><div className="label">月嫂请假待协调</div></div>
       </div>
+
+      {(escalations.length > 0 || avoidPending.length > 0) && (
+        <div className="grid cols-2">
+          <Section title="产妇撤回授权·访客已在场（需护士长现场协调）" tone="tone-red">
+            <DataTable cols={["房间", "探访人", "撤回时间", "原因", "协调"]} empty="暂无在场撤回"
+              rows={escalations.map((a) => [
+                <Link key="r" href={`/stays/${a.stay_id}`}>{String(a.number)}</Link>,
+                <span key="n">{String(a.visitor_name)}<span className="muted small">（{String(a.relation)}）</span></span>,
+                <span key="t" className="small">{dt(a.entered_at_revoke)}</span>,
+                <span key="rs" className="small">{String(a.revoke_reason || "-")}</span>,
+                <DataForm key="f" compact action="auths.escalation.resolve" hidden={{ id: Number(a.id) }}
+                  fields={[{ name: "note", label: "处置说明", required: true, placeholder: "陪同离场 / 现场劝离，回收门禁" }]}
+                  submitLabel="已劝离并回收门禁" />,
+              ])} />
+          </Section>
+          <Section title="探访护理避让执行确认">
+            <DataTable cols={["房间", "避让安排", "时段", "确认"]} empty="暂无待确认避让"
+              rows={avoidPending.map((ca) => [
+                <Link key="r" href={`/stays/${ca.stay_id}`}>{String(ca.number)}</Link>,
+                <span key="t" className="small">{String(ca.title)}</span>,
+                <span key="w" className="small">{dt(ca.window_start)}~{dt(ca.window_end)}</span>,
+                <DataForm key="f" compact action="avoidances.handle" hidden={{ id: Number(ca.id) }}
+                  fields={[{ name: "result", label: "避让结果", required: true, placeholder: "如该时段已暂缓非紧急入房护理" }]}
+                  submitLabel="确认避让" />,
+              ])} />
+          </Section>
+        </div>
+      )}
 
       <Section title="异常工单中心（全中心）" tone={exceptions.length ? "tone-red" : ""}>
         <DataTable cols={["房间", "类型", "标题", "严重度", "状态", "责任角色", "处理"]} empty="暂无待处理异常"
@@ -54,7 +92,7 @@ export default async function HeadNursePage() {
             String(e.assigned_role),
             <DataForm key="f" compact action="exceptions.update" hidden={{ id: Number(e.id) }}
               fields={[
-                { name: "action", label: "操作", type: "select", required: true, options: [
+                { name: "op", label: "操作", type: "select", required: true, options: [
                   { value: "accept", label: "受理" }, { value: "note", label: "追加记录" },
                   { value: "resolve", label: "解决" }, { value: "close", label: "关闭" }] },
                 { name: "note", label: "处理说明" },

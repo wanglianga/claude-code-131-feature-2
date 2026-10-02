@@ -47,6 +47,8 @@ export const EX_TYPES: Record<string, string> = {
   early_checkout: "提前退所",
   record_dispute: "家属质疑护理记录",
   checkout_dispute: "退所争议",
+  visit_gate_block: "探访门禁协同受阻",
+  visit_revoke_entered: "撤回授权时访客已在场",
 };
 
 export const FEE_TYPES: Record<string, string> = {
@@ -80,11 +82,53 @@ export const TASK_STATUS: Record<string, string> = {
 };
 
 export const VISIT_STATUS: Record<string, string> = {
-  pending: "待审核",
+  pending: "待排期",
+  proposed: "已出方案",
+  scheduled: "已排期/已发门禁",
   approved: "已批准",
   rejected: "已拒绝",
   completed: "已完成",
   cancelled: "已取消",
+  no_show: "爽约",
+};
+
+export const VISIT_HEALTH: Record<string, string> = {
+  unknown: "未核验",
+  ok: "健康正常",
+  abnormal: "健康异常",
+};
+
+export const SOLUTION_KIND: Record<string, string> = {
+  normal: "无冲突",
+  queue: "排队放行",
+  split: "拆分时段",
+  reschedule: "改约",
+};
+
+export const SOLUTION_STATUS: Record<string, string> = {
+  proposed: "待前台确认",
+  confirmed: "已确认生效",
+  superseded: "已被新方案替代",
+};
+
+export const PASS_STATUS: Record<string, string> = {
+  active: "门禁有效",
+  inside: "在房内",
+  used: "已出场",
+  revoked: "已失效(撤回)",
+  expired: "已过期",
+};
+
+export const AUTH_STATUS: Record<string, string> = {
+  pending: "待产妇确认",
+  active: "生效中",
+  revoked: "已撤回",
+  revoking: "在场·待护士长协调",
+};
+
+export const AVOID_STATUS: Record<string, string> = {
+  planned: "待避让确认",
+  done: "避让已确认",
 };
 
 export function money(n: unknown): string {
@@ -99,11 +143,11 @@ export function dt(s: unknown): string {
 
 export function badgeClass(status: string): string {
   switch (status) {
-    case "open": case "pending": case "issue": case "new": return "badge red";
-    case "processing": case "planned": case "scheduled": case "following": case "draft": return "badge amber";
-    case "resolved": case "done": case "confirmed": case "approved": case "delivered": case "responded": case "converted": return "badge green";
-    case "closed": case "cancelled": case "void": case "rejected": case "lost": return "badge gray";
-    case "completed": case "active": case "in_stay": return "badge blue";
+    case "open": case "pending": case "issue": case "new": case "no_show": case "revoking": return "badge red";
+    case "processing": case "planned": case "proposed": case "scheduled": case "following": case "draft": return "badge amber";
+    case "resolved": case "done": case "confirmed": case "approved": case "delivered": case "responded": case "converted": case "active": return "badge green";
+    case "closed": case "cancelled": case "void": case "rejected": case "lost": case "revoked": case "expired": return "badge gray";
+    case "completed": case "in_stay": case "inside": return "badge blue";
     case "checked_out": return "badge gray";
     default: return "badge gray";
   }

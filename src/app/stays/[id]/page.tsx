@@ -5,7 +5,8 @@ import { requireUser, can, STAFF_ROLES } from "@/lib/guard";
 import { AppShell, Section, DataTable, KV, Badge } from "@/components/ui";
 import { DataForm, ActionButton } from "@/components/client";
 import {
-  PLAN_TYPES, EX_TYPES, EX_STATUS, SEVERITY, FEE_TYPES, TASK_STATUS, VISIT_STATUS,
+  PLAN_TYPES, EX_TYPES, EX_STATUS, SEVERITY, FEE_TYPES, TASK_STATUS, VISIT_STATUS, VISIT_HEALTH,
+  SOLUTION_KIND, SOLUTION_STATUS, PASS_STATUS, AUTH_STATUS,
   money, dt, badgeClass, severityClass,
 } from "@/lib/labels";
 
@@ -16,7 +17,7 @@ export default async function StayPage({ params }: { params: Promise<{ id: strin
   const user = await requireUser(STAFF_ROLES);
   const stayId = Number(id);
   const stay = q1(
-    `SELECT s.*, r.number AS room_number, r.type AS room_type, p.name AS package_name, p.days AS package_days, p.price AS package_price
+    `SELECT s.*, r.number AS room_number, r.type AS room_type, r.capacity AS capacity, p.name AS package_name, p.days AS package_days, p.price AS package_price
      FROM stays s JOIN rooms r ON r.id=s.room_id JOIN packages p ON p.id=s.package_id WHERE s.id=?`, stayId);
   if (!stay) notFound();
   const inStay = stay.status === "in_stay";
@@ -27,7 +28,14 @@ export default async function StayPage({ params }: { params: Promise<{ id: strin
                    WHERE t.stay_id=? ORDER BY t.scheduled_at DESC LIMIT 30`, stayId);
   const records = q("SELECT * FROM care_records WHERE stay_id=? ORDER BY created_at DESC LIMIT 30", stayId);
   const meals = q("SELECT * FROM meals WHERE stay_id=? ORDER BY meal_date DESC, id DESC LIMIT 15", stayId);
-  const visits = q("SELECT * FROM visits WHERE stay_id=? ORDER BY visit_time DESC LIMIT 15", stayId);
+  const visits = q("SELECT * FROM visits WHERE stay_id=? ORDER BY visit_time DESC LIMIT 20", stayId);
+  const visitAuths = q("SELECT * FROM visit_authorizations WHERE stay_id=? ORDER BY id DESC", stayId);
+  const visitSolutions = q("SELECT * FROM visit_solutions WHERE stay_id=? ORDER BY id DESC LIMIT 10", stayId);
+  const visitPasses = q("SELECT * FROM access_passes WHERE stay_id=? ORDER BY valid_from DESC LIMIT 20", stayId);
+  const visitEvents = q(
+    `SELECT ae.* FROM access_events ae JOIN access_passes ap ON ap.id=ae.pass_id
+     WHERE ap.stay_id=? ORDER BY ae.gate_time DESC LIMIT 20`, stayId);
+  const visitAvoidances = q("SELECT * FROM care_avoidances WHERE stay_id=? ORDER BY window_start DESC LIMIT 20", stayId);
   const hosting = q("SELECT * FROM hosting_logs WHERE stay_id=? ORDER BY start_time DESC LIMIT 15", stayId);
   const rounds = q("SELECT * FROM doctor_rounds WHERE stay_id=? ORDER BY round_date DESC LIMIT 10", stayId);
   const schedules = q(`SELECT ts.*, u.name AS therapist FROM therapist_schedules ts LEFT JOIN users u ON u.id=ts.therapist_id
@@ -85,7 +93,7 @@ export default async function StayPage({ params }: { params: Promise<{ id: strin
             can(user, ["admin", "head_nurse", "nurse", "pediatrician", "nutritionist", "therapist", "frontdesk", "finance"]) && e.status !== "resolved" && e.status !== "closed" ? (
               <DataForm key="f" compact action="exceptions.update" hidden={{ id: Number(e.id) }}
                 fields={[
-                  { name: "action", label: "操作", type: "select", required: true, options: [
+                  { name: "op", label: "操作", type: "select", required: true, options: [
                     { value: "accept", label: "受理" }, { value: "note", label: "追加记录" },
                     { value: "resolve", label: "解决" }, { value: "close", label: "关闭" } ] },
                   { name: "note", label: "处理说明", placeholder: "处理过程 / 解决方案" },
@@ -212,30 +220,104 @@ export default async function StayPage({ params }: { params: Promise<{ id: strin
           )}
         </Section>
 
-        {/* 探访管理 */}
-        <Section title="家属探访（含消毒登记）">
-          <DataTable cols={["探访人", "时间", "时长", "状态", "消毒", "操作"]} empty="暂无探访"
-            rows={visits.map((v) => [
+        {/* 探访管理（简要，详见下方协同专区） */}
+        <Section title="家属探访一览（健康 / 消毒 / 授权 / 爽约）">
+          <DataTable cols={["探访人", "时段", "状态", "授权", "健康", "消毒", "爽约"]} empty="暂无探访"
+            rows={visits.slice(0, 8).map((v) => [
               <span key="a">{String(v.visitor_name)}<span className="muted small">（{String(v.relation)}）</span>{Number(v.is_temp) ? <span className="badge amber">临时</span> : null}</span>,
-              <span key="b" className="small">{dt(v.visit_time)}</span>,
-              `${v.hours}小时`,
+              <span key="b" className="small">{dt(v.visit_time)}~{dt(v.end_time)}</span>,
               <Badge key="c" text={VISIT_STATUS[String(v.status)] || String(v.status)} cls={badgeClass(String(v.status))} />,
+              Number(v.authorized)
+                ? (Number(v.is_temp) ? <span key="au" className={String(v.temp_auth_status) === "active" ? "badge green" : "badge red"}>临时{String(v.temp_auth_status) === "active" ? "已确认" : "待确认"}</span> : <span key="au" className="badge green">已授权</span>)
+                : <span key="au" className="badge red">无授权</span>,
+              <span key="h" className={String(v.health_status) === "ok" ? "badge green" : String(v.health_status) === "abnormal" ? "badge red" : "badge gray"}>{VISIT_HEALTH[String(v.health_status)] || "未核验"}</span>,
               Number(v.disinfected) ? <span key="d" className="badge green">已消毒</span> : <span key="d2" className="badge gray">未登记</span>,
-              can(user, ["frontdesk", "head_nurse", "admin"]) ? (
-                <span key="ops" className="row">
-                  {v.status === "pending" && <>
-                    <ActionButton action="visits.update" payload={{ id: Number(v.id), action: "approve" }} label="批准" kind="primary" />
-                    <ActionButton action="visits.update" payload={{ id: Number(v.id), action: "reject" }} label="拒绝" kind="danger" />
-                  </>}
-                  {v.status === "approved" && !Number(v.disinfected) &&
-                    <ActionButton action="visits.update" payload={{ id: Number(v.id), action: "disinfect" }} label="消毒登记" />}
-                  {v.status === "approved" &&
-                    <ActionButton action="visits.update" payload={{ id: Number(v.id), action: "complete" }} label="完成探访" />}
-                </span>
-              ) : <span key="x" className="muted small">-</span>,
+              Number(v.no_show) ? (v.override_reason ? <span key="ns" className="badge blue">爽约已覆盖</span> : <span key="ns" className="badge red">爽约</span>) : <span key="ns" className="muted small">-</span>,
             ])} />
         </Section>
       </div>
+
+      {/* 探访冲突 / 授权 / 门禁协同专区 */}
+      <Section title="探访冲突协同（授权关系 · 房间容量 · 护理避让 · 婴儿护理 · 门禁原子更新）"
+        extra={<span className="badge amber">{String(stay.room_type)} · 房间容量 {String(stay.capacity ?? 2)} 人</span>}>
+        <div className="muted small mt8">
+          方案综合产妇授权、探访规则、房间容量、护理避让与婴儿护理安排生成；确认时原子更新门禁有效期、访客名单与护理避让，任一环节失败则整体回滚、保留原预约并转人工。
+        </div>
+        {can(user, ["frontdesk", "head_nurse", "admin"]) && (
+          <div className="row mt8">
+            <DataForm compact action="visits.plan" hidden={{ stayId }}
+              fields={[{ name: "date", label: "排期日期", type: "date", required: true, defaultValue: todayStr }]}
+              submitLabel="生成协同方案" />
+          </div>
+        )}
+        <div className="mt8">
+          <DataTable cols={["方案", "日期", "类型/状态", "窗口", "说明", "操作"]} empty="暂无协同方案"
+            rows={visitSolutions.map((sol) => {
+              const items = q("SELECT * FROM visit_solution_items WHERE solution_id=? ORDER BY seq", Number(sol.id));
+              return [
+                <span key="i">#{String(sol.id)}</span>,
+                String(sol.visit_date),
+                <span key="k"><Badge text={SOLUTION_KIND[String(sol.kind)] || String(sol.kind)} cls="badge amber" />
+                  <Badge key="s" text={SOLUTION_STATUS[String(sol.status)] || String(sol.status)} cls={badgeClass(String(sol.status))} /></span>,
+                <span key="w" className="small">{dt(sol.window_start)}~{dt(sol.window_end)}</span>,
+                <span key="r" className="small">{String(sol.reason)}<div className="muted small">
+                  {items.map((it) => {
+                    const vv = q1("SELECT visitor_name FROM visits WHERE id=?", Number(it.visit_id));
+                    return `#${it.seq} ${vv?.visitor_name} ${String(it.assigned_start).slice(11, 16)}-${String(it.assigned_end).slice(11, 16)}`;
+                  }).join("　")}
+                </div></span>,
+                String(sol.status) === "proposed" && can(user, ["frontdesk", "admin"]) ? (
+                  <ActionButton key="cf" action="visits.plan.confirm" payload={{ solutionId: Number(sol.id) }} label="确认(原子生效)" kind="primary"
+                    confirm="门禁/名单/护理避让将原子更新，确认？" />
+                ) : <span key="x" className="muted small">{sol.txn_token ? `事务 ${String(sol.txn_token).slice(0, 12)}` : "-"}</span>,
+              ];
+            })} />
+        </div>
+      </Section>
+
+      <div className="grid cols-2">
+        <Section title="产妇探访授权（可撤回）">
+          <DataTable cols={["探访人", "关系", "类型", "状态", "撤回原因"]} empty="暂无授权"
+            rows={visitAuths.map((a) => [
+              String(a.visitor_name), String(a.relation || "-"),
+              String(a.auth_type) === "temporary" ? "临时" : "常规",
+              <Badge key="s" text={AUTH_STATUS[String(a.status)] || String(a.status)} cls={badgeClass(String(a.status))} />,
+              <span key="r" className="small">{String(a.revoke_reason || "-")}</span>,
+            ])} />
+        </Section>
+
+        <Section title="门禁权限与进出记录">
+          <DataTable cols={["门禁码", "探访人", "有效期", "状态"]} empty="暂未发放门禁"
+            rows={visitPasses.map((p) => [
+              <span key="c" className="small">{String(p.pass_code)}</span>, String(p.visitor_name),
+              <span key="t" className="small">{dt(p.valid_from)}~{dt(p.valid_to)}</span>,
+              <Badge key="s" text={PASS_STATUS[String(p.status)] || String(p.status)} cls={badgeClass(String(p.status))} />,
+            ])} />
+          <ul className="timeline mt8">
+            {visitEvents.slice(0, 8).map((e) => (
+              <li key={String(e.id)}>
+                <span className="t-time">{dt(e.gate_time)}</span>
+                <b>{String(e.visitor_name)}</b> {String(e.direction) === "in" ? "入场" : String(e.direction) === "out" ? "出场" : "门禁失效"}（{String(e.gate)}）
+              </li>
+            ))}
+            {visitEvents.length === 0 && <li className="muted small">暂无进出记录</li>}
+          </ul>
+        </Section>
+      </div>
+
+      <Section title="护理避让结果（决定探访是否闭环）">
+        <DataTable cols={["避让安排", "避让时段", "状态", "结果", "确认"]} empty="暂无护理避让安排"
+          rows={visitAvoidances.map((a) => [
+            <span key="t" className="small">{String(a.title)}</span>,
+            <span key="w" className="small">{dt(a.window_start)}~{dt(a.window_end)}</span>,
+            <Badge key="s" text={String(a.status) === "done" ? "避让已确认" : "待避让确认"} cls={badgeClass(String(a.status) === "done" ? "done" : "planned")} />,
+            <span key="r" className="small">{String(a.result || "-")}</span>,
+            String(a.status) !== "done" && can(user, ["nurse", "matron", "head_nurse", "admin"]) ? (
+              <DataForm key="f" compact action="avoidances.handle" hidden={{ id: Number(a.id) }}
+                fields={[{ name: "result", label: "避让结果", required: true }]} submitLabel="确认避让" />
+            ) : <span key="x" className="muted small">-</span>,
+          ])} />
+      </Section>
 
       <div className="grid cols-2">
         {/* 宝宝托管 */}
@@ -288,8 +370,8 @@ export default async function StayPage({ params }: { params: Promise<{ id: strin
               <Badge key="b" text={{ scheduled: "已排班", done: "已完成", delayed: "已延期", cancelled: "已取消" }[String(s.status)] || String(s.status)} cls={badgeClass(String(s.status))} />,
               s.status === "scheduled" && can(user, ["therapist", "head_nurse", "admin"]) ? (
                 <span key="ops" className="row">
-                  <ActionButton action="schedules.update" payload={{ id: Number(s.id), action: "done" }} label="完成" />
-                  <DataForm compact action="schedules.update" hidden={{ id: Number(s.id), action: "delay" }}
+                  <ActionButton action="schedules.update" payload={{ id: Number(s.id), op: "done" }} label="完成" />
+                  <DataForm compact action="schedules.update" hidden={{ id: Number(s.id), op: "delay" }}
                     fields={[
                       { name: "reason", label: "延期原因", required: true },
                       { name: "newTime", label: "改期至", type: "datetime-local", required: true },

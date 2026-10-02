@@ -2,6 +2,8 @@
 import { q, q1, run, now, today, addDays, hashPassword } from "./db";
 import crypto from "node:crypto";
 import type { SessionUser } from "./auth";
+import { audit, createException, notifyStaff } from "./actions-helper";
+import { planVisits, confirmPlan, activeAuth, visitBlockers } from "./visits";
 
 type Payload = Record<string, unknown>;
 type Row = Record<string, unknown>;
@@ -20,42 +22,7 @@ function req(p: Payload, k: string, label: string): string {
   return v;
 }
 
-export function audit(stayId: number | null, user: SessionUser | null, action: string, detail: string) {
-  run("INSERT INTO audit_logs(stay_id,actor_id,actor_name,action,detail) VALUES(?,?,?,?,?)",
-    stayId, user ? user.id : null, user ? user.name : "系统", action, detail);
-}
-
-// 异常类型 → 默认责任角色 / 是否同步护士长
-const EX_ROUTE: Record<string, { role: string; sync: boolean }> = {
-  jaundice: { role: "pediatrician", sync: true },
-  breast_blockage: { role: "head_nurse", sync: true },
-  extra_visit: { role: "frontdesk", sync: false },
-  matron_leave: { role: "head_nurse", sync: true },
-  meal_taboo: { role: "nutritionist", sync: true },
-  project_delay: { role: "therapist", sync: false },
-  package_upgrade: { role: "finance", sync: false },
-  room_upgrade: { role: "frontdesk", sync: false },
-  early_checkout: { role: "finance", sync: true },
-  record_dispute: { role: "head_nurse", sync: true },
-  checkout_dispute: { role: "head_nurse", sync: true },
-};
-
-export function createException(
-  stayId: number, type: string, title: string, description: string,
-  severity: string, user: SessionUser | null
-): number {
-  const route = EX_ROUTE[type] || { role: "head_nurse", sync: true };
-  const id = run(
-    `INSERT INTO exceptions(stay_id,type,title,description,severity,status,raised_by,raised_by_name,assigned_role,synced_head_nurse)
-     VALUES(?,?,?,?,?,'open',?,?,?,?)`,
-    stayId, type, title, description, severity,
-    user ? user.id : null, user ? user.name : "系统", route.role, route.sync ? 1 : 0
-  );
-  run("INSERT INTO exception_events(exception_id,user_id,user_name,action,note) VALUES(?,?,?,?,?)",
-    id, user ? user.id : null, user ? user.name : "系统", "created", description || title);
-  audit(stayId, user, "异常上报", `【${title}】${description}`);
-  return id;
-}
+export { audit, createException } from "./actions-helper";
 
 // 忌口关键词（含常见同义词）
 const TABOO_SYNONYMS: Record<string, string[]> = {
@@ -418,7 +385,7 @@ const ACTIONS: Record<string, { roles: string[]; run: Handler }> = {
     },
   },
 
-  // ---- 探访 ----
+  // ---- 探访申请（写入日期/时长/授权与健康初态，供方案引擎排队）----
   "visits.create": {
     roles: ["family", "frontdesk", "admin"],
     run(user, p) {
@@ -427,38 +394,340 @@ const ACTIONS: Record<string, { roles: string[]; run: Handler }> = {
       const stay = mustStay(stayId);
       if (stay.status !== "in_stay") throw new Error("已出所，无法预约探访");
       const isTemp = p.isTemp === true || p.isTemp === "true" || num(p, "isTemp") === 1 ? 1 : 0;
-      const id = run("INSERT INTO visits(stay_id,visitor_name,relation,visit_time,hours,is_temp,created_by) VALUES(?,?,?,?,?,?,?)",
-        stayId, req(p, "visitorName", "探访人"), str(p, "relation"), req(p, "visitTime", "探访时间"),
-        num(p, "hours", 2), isTemp, user.id);
+      const visitTime = req(p, "visitTime", "探访时间");
+      const hours = Math.max(1, num(p, "hours", 2));
+      const visitor = req(p, "visitorName", "探访人");
+      // 既有有效授权决定申请的授权初态；爽约记录影响后续排队优先级（可被前台覆盖）
+      const auth = activeAuth(stayId, visitor);
+      let authorized = 0;
+      let tempAuthStatus = "";
+      if (auth) {
+        authorized = 1;
+        tempAuthStatus = String(auth.auth_type) === "temporary" ? "active" : "";
+      } else if (isTemp) {
+        tempAuthStatus = "pending"; // 临时授权尚待产妇确认
+      }
+      const penalty = q(
+        "SELECT COUNT(*) AS c FROM visits WHERE stay_id=? AND visitor_name=? AND no_show=1 AND (override_reason IS NULL OR override_reason='')",
+        stayId, visitor);
+      const priority = 5 + 2 * Number(penalty[0]?.c || 0);
+      const id = run(
+        `INSERT INTO visits(stay_id,visitor_name,relation,visit_time,visit_date,end_time,hours,is_temp,
+           status,health_status,authorized,temp_auth_status,priority,created_by)
+         VALUES(?,?,?,?,?,?,?,?,'pending','unknown',?,?,?,?)`,
+        stayId, visitor, str(p, "relation"), visitTime, visitTime.slice(0, 10),
+        (() => { const d = new Date(visitTime.replace(" ", "T")); d.setHours(d.getHours() + hours); const x = (n: number) => String(n).padStart(2, "0"); return `${d.getFullYear()}-${x(d.getMonth() + 1)}-${x(d.getDate())} ${x(d.getHours())}:${x(d.getMinutes())}`; })(),
+        hours, isTemp, authorized, tempAuthStatus, priority, user.id);
       if (isTemp) {
         createException(stayId, "extra_visit", "家属临时增加探访",
-          `${str(p, "visitorName")}（${str(p, "relation")}）申请临时探访：${str(p, "visitTime")}`, "medium", user);
+          `${visitor}（${str(p, "relation")}）申请临时探访：${visitTime}${auth ? "" : "，临时授权待产妇确认"}`, "medium", user);
       }
-      audit(stayId, user, "探访预约", `${str(p, "visitorName")} 预约 ${str(p, "visitTime")}${isTemp ? "（临时）" : ""}`);
-      return { id, message: "探访预约已提交，待前台审核" };
+      audit(stayId, user, "探访预约", `${visitor} 预约 ${visitTime}${isTemp ? "（临时）" : ""}，授权${authorized ? "有效" : "待确认"}`);
+      return { id, authorized, message: authorized ? "探访预约已提交，待前台核验健康与消毒后排期" : "探访预约已提交；临时授权需产妇确认后方可排期" };
     },
   },
 
+  // 兼容旧入口：批准/拒绝/取消（不直接发门禁，门禁一律经方案确认原子发放）
   "visits.update": {
     roles: ["frontdesk", "head_nurse", "admin"],
     run(user, p) {
       const id = num(p, "id");
       const v = q1("SELECT * FROM visits WHERE id=?", id);
       if (!v) throw new Error("探访记录不存在");
-      const action = req(p, "action", "操作");
-      if (action === "approve" || action === "reject") {
-        run("UPDATE visits SET status=?, approved_by=? WHERE id=?", action === "approve" ? "approved" : "rejected", user.id, id);
-      } else if (action === "disinfect") {
-        run("UPDATE visits SET disinfected=1, disinfection_note=? WHERE id=?", str(p, "note", "入所前消毒+测温完成"), id);
-      } else if (action === "complete") {
-        run("UPDATE visits SET status='completed' WHERE id=?", id);
+      const action = req(p, "op", "操作");
+      if (action === "reject") {
+        run("UPDATE visits SET status='rejected', approved_by=? WHERE id=?", user.id, id);
       } else if (action === "cancel") {
         run("UPDATE visits SET status='cancelled' WHERE id=?", id);
+        run("UPDATE access_passes SET status='revoked', revoked_at=?, revoke_reason='探访取消' WHERE visit_id=? AND entered_at IS NULL", now(), id);
       } else {
-        throw new Error("未知操作");
+        throw new Error("请使用「生成协同方案」进行排期与门禁发放");
       }
       audit(Number(v.stay_id), user, "探访管理", `${v.visitor_name}（${v.visit_time}）：${action}`);
       return { message: "已处理" };
+    },
+  },
+
+  // 前台登记探访人健康核验（异常即阻断门禁）
+  "visits.health": {
+    roles: ["frontdesk", "head_nurse", "admin"],
+    run(user, p) {
+      const v = q1("SELECT * FROM visits WHERE id=?", num(p, "id"));
+      if (!v) throw new Error("探访记录不存在");
+      const result = req(p, "result", "健康核验结果");
+      if (!["ok", "abnormal"].includes(result)) throw new Error("健康结果只能为正常/异常");
+      run("UPDATE visits SET health_status=?, health_note=? WHERE id=?", result, str(p, "note"), Number(v.id));
+      if (result === "abnormal") {
+        createException(Number(v.stay_id), "visit_gate_block", `探访人健康异常：${String(v.visitor_name)}`,
+          `前台核验${String(v.visit_time)}探访人${String(v.visitor_name)}健康异常：${str(p, "note") || "测温/症状异常"}。门禁不予发放，请人工安排改约。`, "high", user);
+      }
+      audit(Number(v.stay_id), user, "探访健康核验", `${String(v.visitor_name)}：${result === "ok" ? "正常" : "异常"}${str(p, "note") ? "：" + str(p, "note") : ""}`);
+      return { message: result === "ok" ? "健康核验通过" : "已登记健康异常并阻断门禁、转人工处理" };
+    },
+  },
+
+  // 前台登记入所消毒
+  "visits.disinfect": {
+    roles: ["frontdesk", "head_nurse", "admin"],
+    run(user, p) {
+      const v = q1("SELECT * FROM visits WHERE id=?", num(p, "id"));
+      if (!v) throw new Error("探访记录不存在");
+      run("UPDATE visits SET disinfected=1, disinfection_note=? WHERE id=?", str(p, "note", "入所前消毒+测温完成"), Number(v.id));
+      audit(Number(v.stay_id), user, "探访消毒登记", `${String(v.visitor_name)}：${str(p, "note", "入所前消毒+测温完成")}`);
+      return { message: "消毒已登记" };
+    },
+  },
+
+  // 生成协同方案（排队 / 拆分时段 / 改约）
+  "visits.plan": {
+    roles: ["frontdesk", "head_nurse", "admin"],
+    run(user, p) {
+      const stayId = num(p, "stayId");
+      const date = req(p, "date", "日期");
+      const r = planVisits(stayId, date, user);
+      const blocked = r.items.filter((i) => i.blockers.length).length;
+      const kindText = r.kind === "queue" ? "排队" : r.kind === "split" ? "拆分时段" : r.kind === "reschedule" ? "改约" : "原样安排";
+      return {
+        solutionId: r.solutionId, kind: r.kind,
+        items: r.items.map((i) => ({
+          visitId: i.visitId, visitor: i.visitor, start: i.start, end: i.end,
+          kind: i.kind, queueNo: i.queueNo, priority: i.priority,
+          blockers: i.blockers.map((b) => b.code), blockerLabels: i.blockers.map((b) => b.label),
+          careConflicts: i.careConflicts,
+        })),
+        message: `已生成${kindText}方案（方案#${r.solutionId}）${blocked ? `；其中 ${blocked} 人存在授权/健康/消毒前置项，确认时将被拦截` : "；前置项齐备，可由前台确认后发放门禁"}`,
+      };
+    },
+  },
+
+  // 前台确认方案：门禁有效期+访客名单+护理避让 原子更新
+  "visits.plan.confirm": {
+    roles: ["frontdesk", "admin"],
+    run(user, p) {
+      const r = confirmPlan(num(p, "solutionId"), user);
+      return {
+        passCount: r.passCount, avoidCount: r.avoidCount,
+        passes: r.passes, avoidanceIds: r.avoidanceIds, txnToken: r.txnToken,
+        message: `方案已原子生效：发放门禁 ${r.passCount} 张（${r.passes.map((x) => x.code).join("、")}）、联动护理避让 ${r.avoidCount} 项（门禁/名单/避让同成同败）`,
+      };
+    },
+  },
+
+  // 产妇（家属账号代行）授予临时授权 —— 需再点一次「确认」才生效，生效前不发门禁
+  "auths.grant": {
+    roles: ["family", "frontdesk", "admin"],
+    run(user, p) {
+      const stayId = num(p, "stayId");
+      assertFamilyStay(user, stayId);
+      mustStay(stayId);
+      const visitor = req(p, "visitorName", "被授权探访人");
+      if (activeAuth(stayId, visitor)) throw new Error("该探访人已有有效授权");
+      const existPending = q1("SELECT id FROM visit_authorizations WHERE stay_id=? AND visitor_name=? AND status='pending' ORDER BY id DESC LIMIT 1",
+        stayId, visitor);
+      if (existPending) {
+        return { id: Number(existPending.id), message: "该探访人已有待确认的授权申请，请直接确认" };
+      }
+      const authType = str(p, "authType", "temporary") === "routine" ? "routine" : "temporary";
+      const id = run(
+        `INSERT INTO visit_authorizations(stay_id,visitor_name,relation,auth_type,status,granted_by,granted_by_name,valid_from,valid_to)
+         VALUES(?,?,?,?, 'pending', ?,?,?,?)`,
+        stayId, visitor, str(p, "relation"), authType, user.id, user.name,
+        str(p, "validFrom"), str(p, "validTo"));
+      audit(stayId, user, "探访授权申请", `${visitor}（${authType === "routine" ? "常规" : "临时"}）授权待产妇确认`);
+      return { id, message: "授权申请已提交，需产妇确认后生效" };
+    },
+  },
+
+  // 产妇确认临时/常规授权（前台无权代确认）
+  "auths.confirm": {
+    roles: ["family"],
+    run(user, p) {
+      const a = q1("SELECT * FROM visit_authorizations WHERE id=?", num(p, "id"));
+      if (!a) throw new Error("授权不存在");
+      assertFamilyStay(user, Number(a.stay_id));
+      if (String(a.status) !== "pending") throw new Error("该授权已处理，请勿重复确认");
+      run("UPDATE visit_authorizations SET status='active', confirmed_by=?, confirmed_at=? WHERE id=?", user.id, now(), Number(a.id));
+      // 同步激活该探访人待处理申请的授权位
+      run("UPDATE visits SET authorized=1, temp_auth_status=CASE WHEN is_temp=1 THEN 'active' ELSE temp_auth_status END WHERE stay_id=? AND visitor_name=? AND status='pending'",
+        Number(a.stay_id), String(a.visitor_name));
+      audit(Number(a.stay_id), user, "探访授权确认", `${String(a.visitor_name)} 授权生效（${String(a.auth_type) === "temporary" ? "临时" : "常规"}）`);
+      return { message: "授权已生效，前台可继续健康/消毒核验并排期" };
+    },
+  },
+
+  // 产妇撤回授权：未入场立即失效门禁并通知前台；已入场升级护士长协调
+  "auths.revoke": {
+    roles: ["family"],
+    run(user, p) {
+      const a = q1("SELECT * FROM visit_authorizations WHERE id=?", num(p, "id"));
+      if (!a) throw new Error("授权不存在");
+      assertFamilyStay(user, Number(a.stay_id));
+      if (!["active", "revoking"].includes(String(a.status))) throw new Error("该授权非生效状态，无法撤回");
+      const stayId = Number(a.stay_id);
+      const reason = str(p, "reason", "产妇撤回授权");
+      // 已升级护士长协调（在场）：幂等返回，避免重复建工单
+      if (String(a.status) === "revoking") {
+        return { escalated: true, message: "该撤回已升级护士长现场协调，等待陪同离场处理" };
+      }
+      // 该探访人名下、尚未入场的有效门禁
+      const openPasses = q(
+        `SELECT ap.* FROM access_passes ap WHERE ap.stay_id=? AND ap.visitor_name=?
+           AND ap.status IN ('active') AND ap.entered_at IS NULL`, stayId, String(a.visitor_name));
+      const insidePasses = q(
+        `SELECT ap.* FROM access_passes ap WHERE ap.stay_id=? AND ap.visitor_name=?
+           AND ap.status='inside'`, stayId, String(a.visitor_name));
+      if (insidePasses.length) {
+        // 已入场：不直接关门，升级护士长现场协调
+        run("UPDATE visit_authorizations SET status='revoking', escalated=1, entered_at_revoke=?, revoked_by=?, revoked_by_name=?, revoke_reason=? WHERE id=?",
+          now(), user.id, user.name, reason, Number(a.id));
+        const exId = createException(stayId, "visit_revoke_entered", `产妇撤回授权但探访人已在场：${String(a.visitor_name)}`,
+          `产妇于${now()}撤回对${String(a.visitor_name)}的探访授权，但其已进入房间，门禁保持待协调，需护士长现场劝离/陪同离场后回收门禁。原因：${reason}`, "critical", user);
+        notifyStaff(stayId, "staff", user, `【紧急】产妇撤回${String(a.visitor_name)}授权且人已在房，请护士长立即到场协调（工单#${exId}）`);
+        audit(stayId, user, "探访授权撤回(在场)", `${String(a.visitor_name)} 已入场，升级护士长协调（工单#${exId}）`);
+        return { escalated: true, message: "探访人已入场，已升级护士长现场协调，未自动关闭门禁" };
+      }
+      // 未入场：立即失效门禁 + 取消未入场探访 + 通知前台
+      run("UPDATE visit_authorizations SET status='revoked', revoked_at=?, revoked_by=?, revoked_by_name=?, revoke_reason=? WHERE id=?",
+        now(), user.id, user.name, reason, Number(a.id));
+      for (const pass of openPasses) {
+        run("UPDATE access_passes SET status='revoked', revoked_at=?, revoke_reason=? WHERE id=?", now(), reason, Number(pass.id));
+        run("INSERT INTO access_events(pass_id,stay_id,visit_id,visitor_name,direction,gate_time,gate) VALUES(?,?,?,?, 'revoke', ?, ?)",
+          Number(pass.id), stayId, pass.visit_id ? Number(pass.visit_id) : null, String(pass.visitor_name), now(), "授权撤回系统失效");
+      }
+      run("UPDATE visits SET status='cancelled', revoked_at=? WHERE stay_id=? AND visitor_name=? AND status IN ('scheduled','approved','pending') AND entered_at IS NULL",
+        now(), stayId, String(a.visitor_name));
+      notifyStaff(stayId, "staff", user, `产妇已撤回对${String(a.visitor_name)}的探访授权，未入场门禁已立即失效，请前台知悉并更新访客名单。`);
+      audit(stayId, user, "探访授权撤回", `${String(a.visitor_name)} 未入场，${openPasses.length}张门禁立即失效，已通知前台`);
+      return { revokedPasses: openPasses.length, message: `授权已撤回，未入场门禁 ${openPasses.length} 张立即失效，前台已收到通知` };
+    },
+  },
+
+  // 护士长协调在场撤回：陪同离场后回收门禁并结案
+  "auths.escalation.resolve": {
+    roles: ["head_nurse", "admin"],
+    run(user, p) {
+      const a = q1("SELECT * FROM visit_authorizations WHERE id=?", num(p, "id"));
+      if (!a) throw new Error("授权不存在");
+      if (String(a.status) !== "revoking") throw new Error("该授权不在待协调状态");
+      const stayId = Number(a.stay_id);
+      const inside = q("SELECT * FROM access_passes WHERE stay_id=? AND visitor_name=? AND status='inside'", stayId, String(a.visitor_name));
+      for (const pass of inside) {
+        run("UPDATE access_passes SET status='used', exited_at=? WHERE id=?", now(), Number(pass.id));
+        run("INSERT INTO access_events(pass_id,stay_id,visit_id,visitor_name,direction,gate_time,gate) VALUES(?,?,?,?, 'out', ?, ?)",
+          Number(pass.id), stayId, pass.visit_id ? Number(pass.visit_id) : null, String(pass.visitor_name), now(), "护士长陪同离场");
+        if (pass.visit_id) run("UPDATE visits SET status='completed' WHERE id=?", Number(pass.visit_id));
+      }
+      run("UPDATE visit_authorizations SET status='revoked', escalated=0, revoked_at=COALESCE(revoked_at,?) WHERE id=?", now(), Number(a.id));
+      const ex = q1("SELECT id FROM exceptions WHERE stay_id=? AND type='visit_revoke_entered' AND status!='closed' ORDER BY id DESC LIMIT 1", stayId);
+      if (ex) {
+        run("UPDATE exceptions SET status='resolved', resolution=?, resolved_at=?, updated_at=? WHERE id=?",
+          `护士长已协调${String(a.visitor_name)}离场并回收门禁：${str(p, "note", "现场劝离")}`, now(), now(), Number(ex.id));
+        run("INSERT INTO exception_events(exception_id,user_id,user_name,action,note) VALUES(?,?,?, 'resolved',?)",
+          Number(ex.id), user.id, user.name, str(p, "note", "陪同离场，门禁回收"));
+      }
+      audit(stayId, user, "在场撤回协调结案", `${String(a.visitor_name)} 已陪同离场，门禁回收，授权撤销`);
+      return { message: "已协调探访人离场、回收门禁并结案" };
+    },
+  },
+
+  // 门禁进出（前台/闸机）：校验有效期并留痕
+  "gates.swipe": {
+    roles: ["frontdesk", "head_nurse", "admin"],
+    run(user, p) {
+      const code = req(p, "passCode", "门禁码").trim().toUpperCase();
+      const dir = req(p, "direction", "方向") === "out" ? "out" : "in";
+      const pass = q1("SELECT * FROM access_passes WHERE pass_code=?", code);
+      if (!pass) throw new Error("门禁码无效");
+      const t = now();
+      if (dir === "in") {
+        if (String(pass.status) !== "active") throw new Error(`门禁当前状态不可入场（${String(pass.status)}）`);
+        // 允许窗口开始前 30 分钟内提前入场（前台常见接待），窗口结束后不得入场
+        const fromD = new Date(String(pass.valid_from).replace(" ", "T") + ":00");
+        fromD.setMinutes(fromD.getMinutes() - 30);
+        const p2 = (n: number) => String(n).padStart(2, "0");
+        const earliest = `${fromD.getFullYear()}-${p2(fromD.getMonth() + 1)}-${p2(fromD.getDate())} ${p2(fromD.getHours())}:${p2(fromD.getMinutes())}`;
+        if (t < earliest || t > String(pass.valid_to).slice(0, 16)) {
+          throw new Error(`不在门禁有效期内（${String(pass.valid_from).slice(11, 16)}-${String(pass.valid_to).slice(11, 16)}），请联系前台`);
+        }
+        run("UPDATE access_passes SET status='inside', entered_at=? WHERE id=?", t, Number(pass.id));
+        if (pass.visit_id) run("UPDATE visits SET entered_at=?, actual_count=MAX(actual_count,1) WHERE id=?", t, Number(pass.visit_id));
+      } else {
+        if (String(pass.status) !== "inside") throw new Error("该门禁未处于在房状态，无法出场");
+        run("UPDATE access_passes SET status='used', exited_at=? WHERE id=?", t, Number(pass.id));
+      }
+      run("INSERT INTO access_events(pass_id,stay_id,visit_id,visitor_name,direction,gate_time,gate) VALUES(?,?,?,?,?,?,?)",
+        Number(pass.id), Number(pass.stay_id), pass.visit_id ? Number(pass.visit_id) : null, String(pass.visitor_name), dir, t, str(p, "gate", "楼层门禁"));
+      audit(Number(pass.stay_id), user, "门禁刷卡", `${String(pass.visitor_name)} ${dir === "in" ? "入场" : "出场"} ${code}`);
+      return { message: `${String(pass.visitor_name)} ${dir === "in" ? "入场成功" : "出场成功"}`, visitor: String(pass.visitor_name), direction: dir };
+    },
+  },
+
+  // 爽约登记：未按约到场 → 记录并影响后续优先级
+  "visits.noshow": {
+    roles: ["frontdesk", "head_nurse", "admin"],
+    run(user, p) {
+      const v = q1("SELECT * FROM visits WHERE id=?", num(p, "id"));
+      if (!v) throw new Error("探访记录不存在");
+      if (v.entered_at) throw new Error("探访人已入场，不能记爽约");
+      run("UPDATE visits SET no_show=1, status='no_show' WHERE id=?", Number(v.id));
+      run("UPDATE access_passes SET status='expired' WHERE visit_id=? AND entered_at IS NULL AND status='active'", Number(v.id));
+      audit(Number(v.stay_id), user, "探访爽约", `${String(v.visitor_name)} 未按约到场（${String(v.visit_time)}），后续同名人排队优先级下调`);
+      return { message: "已登记爽约，该探访人后续预约优先级下调" };
+    },
+  },
+
+  // 前台基于紧急照护 / 产妇书面确认覆盖爽约限制，并留理由
+  "visits.override": {
+    roles: ["frontdesk", "head_nurse", "admin"],
+    run(user, p) {
+      const v = q1("SELECT * FROM visits WHERE id=?", num(p, "id"));
+      if (!v) throw new Error("探访记录不存在");
+      const basis = req(p, "basis", "覆盖依据");
+      if (!["urgent_care", "mother_written"].includes(basis)) throw new Error("覆盖依据只能是紧急照护或产妇书面确认");
+      const reason = req(p, "reason", "覆盖理由");
+      run("UPDATE visits SET override_reason=?, override_by=?, no_show=CASE WHEN ?=1 THEN 0 ELSE no_show END WHERE id=?",
+        `[${basis === "urgent_care" ? "紧急照护" : "产妇书面确认"}] ${reason}`, user.id, p.clearNoShow === true ? 1 : 0, Number(v.id));
+      audit(Number(v.stay_id), user, "爽约限制覆盖", `${String(v.visitor_name)}：${basis === "urgent_care" ? "紧急照护" : "产妇书面确认"}｜${reason}`);
+      return { message: "已覆盖爽约优先级限制并留存理由" };
+    },
+  },
+
+  // 护理师/护士长确认探访避让结果
+  "avoidances.handle": {
+    roles: ["nurse", "matron", "head_nurse", "admin"],
+    run(user, p) {
+      const a = q1("SELECT * FROM care_avoidances WHERE id=?", num(p, "id"));
+      if (!a) throw new Error("避让安排不存在");
+      run("UPDATE care_avoidances SET status='done', result=?, handled_at=? WHERE id=?",
+        req(p, "result", "避让结果"), now(), Number(a.id));
+      audit(Number(a.stay_id), user, "护理避让确认", `${String(a.title).slice(0, 40)}：${str(p, "result")}`);
+      return { message: "避让结果已记录" };
+    },
+  },
+
+  // 活动结束闭环：门禁进出 + 实际探访人数 + 护理避让结果 共同决定
+  "visits.closeout": {
+    roles: ["frontdesk", "head_nurse", "admin"],
+    run(user, p) {
+      const v = q1("SELECT * FROM visits WHERE id=?", num(p, "id"));
+      if (!v) throw new Error("探访记录不存在");
+      const stayId = Number(v.stay_id);
+      const events = q("SELECT direction FROM access_events WHERE visit_id=? ORDER BY gate_time", Number(v.id));
+      const entered = events.some((e) => String(e.direction) === "in");
+      const exited = events.some((e) => String(e.direction) === "out");
+      const inside = q1("SELECT COUNT(*) AS c FROM access_passes WHERE visit_id=? AND status='inside'", Number(v.id));
+      const pendAvoid = q(
+        `SELECT COUNT(*) AS c FROM care_avoidances WHERE visit_id=? AND status!='done'`, Number(v.id));
+      const solutionAvoid = v.plan_id ? q(
+        `SELECT COUNT(*) AS c FROM care_avoidances WHERE solution_id=? AND status!='done'`, Number(v.plan_id)) : [{ c: 0 }];
+      const avoidPending = Number(pendAvoid[0]?.c || 0) + Number(solutionAvoid[0]?.c || 0);
+      if (Number(inside?.c || 0) > 0 || (entered && !exited)) throw new Error("访客尚未离场（门禁无出场记录），暂不能闭环");
+      if (!entered) throw new Error("门禁无入场记录：如确属未到场请先登记爽约，否则不能闭环");
+      if (avoidPending > 0) throw new Error(`尚有 ${avoidPending} 项护理避让结果未确认，护理计划未闭环，暂不能关闭预约`);
+      const actual = entered ? 1 : 0;
+      run("UPDATE visits SET status='completed', actual_count=?, closed_result='closed', closed_at=? WHERE id=?", actual, now(), Number(v.id));
+      audit(stayId, user, "探访闭环", `${String(v.visitor_name)}：进出记录齐全、实到${actual}人、避让全部确认，预约闭环`);
+      return { message: `探访闭环完成：实到 ${actual} 人，进出与护理避让均已核对` };
     },
   },
 
@@ -529,7 +798,7 @@ const ACTIONS: Record<string, { roles: string[]; run: Handler }> = {
     run(user, p) {
       const s = q1("SELECT * FROM therapist_schedules WHERE id=?", num(p, "id"));
       if (!s) throw new Error("排班不存在");
-      const action = req(p, "action", "操作");
+      const action = req(p, "op", "操作");
       if (action === "done") {
         run("UPDATE therapist_schedules SET status='done', done_at=? WHERE id=?", now(), Number(s.id));
       } else if (action === "delay") {
@@ -598,7 +867,7 @@ const ACTIONS: Record<string, { roles: string[]; run: Handler }> = {
     run(user, p) {
       const ex = q1("SELECT * FROM exceptions WHERE id=?", num(p, "id"));
       if (!ex) throw new Error("工单不存在");
-      const action = req(p, "action", "操作");
+      const action = req(p, "op", "操作");
       const note = str(p, "note");
       let status = String(ex.status);
       if (action === "accept") status = "processing";

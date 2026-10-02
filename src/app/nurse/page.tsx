@@ -4,7 +4,6 @@ import { requireUser } from "@/lib/guard";
 import { AppShell, Section, DataTable, Badge } from "@/components/ui";
 import { DataForm } from "@/components/client";
 import { PLAN_TYPES, TASK_STATUS, dt, badgeClass } from "@/lib/labels";
-
 export const dynamic = "force-dynamic";
 
 export default async function NursePage() {
@@ -25,6 +24,11 @@ export default async function NursePage() {
   const inStays = q(
     `SELECT s.id, s.mother_name, s.baby_name, s.jaundice_level, r.number FROM stays s
      JOIN rooms r ON r.id=s.room_id WHERE s.status='in_stay' ORDER BY r.number`);
+  // 探访护理避让（今日+明日待确认）：探访窗口内暂缓非紧急入房护理
+  const avoidances = q(
+    `SELECT ca.*, r.number, s.mother_name FROM care_avoidances ca
+     JOIN stays s ON s.id=ca.stay_id JOIN rooms r ON r.id=s.room_id
+     WHERE ca.status='planned' ORDER BY ca.window_start LIMIT 20`);
 
   return (
     <AppShell title={user.role === "matron" ? "月嫂工作台" : "护理工作台"}>
@@ -48,6 +52,19 @@ export default async function NursePage() {
                 fields={[{ name: "record", label: "执行记录", required: true, placeholder: "如：体温正常，切口干燥" }]}
                 submitLabel="完成" />
             ) : <span key="d" className="muted small">{t.done_at ? dt(t.done_at) : "-"}</span>,
+          ])} />
+      </Section>
+
+      <Section title="探访护理避让（探访窗口内暂缓非紧急查房/护理，紧急护理除外）"
+        tone={avoidances.length ? "tone-amber" : ""}>
+        <DataTable cols={["房间", "避让安排", "避让时段", "确认"]} empty="暂无探访避让安排"
+          rows={avoidances.map((a) => [
+            <Link key="r" href={`/stays/${a.stay_id}`}>{String(a.number)}</Link>,
+            <span key="t">{String(a.title)}<div className="muted small">{String(a.mother_name)}</div></span>,
+            <span key="w" className="small">{dt(a.window_start)} ~ {dt(a.window_end)}</span>,
+            <DataForm key="f" compact action="avoidances.handle" hidden={{ id: Number(a.id) }}
+              fields={[{ name: "result", label: "避让结果", required: true, placeholder: "如已暂缓入房护理，紧急情况除外" }]}
+              submitLabel="确认避让" />,
           ])} />
       </Section>
 

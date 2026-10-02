@@ -1,0 +1,25 @@
+services:
+  mcare:
+    build: .
+    image: mooncare-platform:latest
+    container_name: mooncare-platform
+    ports:
+      - "3000:3000"
+    environment:
+      # 生产环境请务必改成随机密钥
+      MCARE_SECRET: change-me-in-production
+      MCARE_DB: /app/data/mcare.db
+      NODE_ENV: production
+    volumes:
+      # SQLite 数据持久化：删除/重建容器不丢数据
+      - mcare-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  mcare-data:

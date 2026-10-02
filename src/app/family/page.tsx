@@ -2,8 +2,8 @@ import { redirect } from "next/navigation";
 import { q, q1 } from "@/lib/db";
 import { requireUser } from "@/lib/guard";
 import { AppShell, Section, DataTable, KV, Badge } from "@/components/ui";
-import { DataForm } from "@/components/client";
-import { PLAN_TYPES, VISIT_STATUS, FEE_TYPES, money, dt, badgeClass } from "@/lib/labels";
+import { DataForm, ActionButton } from "@/components/client";
+import { PLAN_TYPES, VISIT_STATUS, VISIT_HEALTH, FEE_TYPES, AUTH_STATUS, PASS_STATUS, money, dt, badgeClass } from "@/lib/labels";
 
 export const dynamic = "force-dynamic";
 
@@ -34,7 +34,14 @@ export default async function FamilyPage() {
     ? q(`SELECT t.*, u.name AS assignee FROM care_tasks t LEFT JOIN users u ON u.id=t.assignee_id
          WHERE t.stay_id=? AND t.visible_to_family=1 AND t.status='done' ORDER BY t.done_at DESC LIMIT 10`, stayId)
     : [];
-  const visits = showVisits ? q("SELECT * FROM visits WHERE stay_id=? ORDER BY visit_time DESC LIMIT 10", stayId) : [];
+  const visits = showVisits ? q("SELECT * FROM visits WHERE stay_id=? ORDER BY visit_time DESC LIMIT 12", stayId) : [];
+  const authorizations = showVisits ? q("SELECT * FROM visit_authorizations WHERE stay_id=? ORDER BY id DESC", stayId) : [];
+  const passes = showVisits
+    ? q("SELECT * FROM access_passes WHERE stay_id=? ORDER BY valid_from DESC LIMIT 12", stayId) : [];
+  const passEvents = showVisits
+    ? q("SELECT ae.* FROM access_events ae JOIN access_passes ap ON ap.id=ae.pass_id WHERE ap.stay_id=? ORDER BY ae.gate_time DESC LIMIT 12", stayId) : [];
+  const myAvoidances = showVisits
+    ? q("SELECT * FROM care_avoidances WHERE stay_id=? ORDER BY window_start DESC LIMIT 6", stayId) : [];
   const fees = showFees ? q("SELECT * FROM fees WHERE stay_id=? AND status='confirmed' ORDER BY created_at", stayId) : [];
   const settlement = showFees ? q1("SELECT * FROM settlements WHERE stay_id=?", stayId) : undefined;
   const feedbacks = q("SELECT * FROM feedbacks WHERE stay_id=? ORDER BY created_at DESC LIMIT 10", stayId);
@@ -97,9 +104,41 @@ export default async function FamilyPage() {
         </div>
       )}
 
+      {showVisits && (
+        <Section title="探访授权管理（产妇可随时撤回）">
+            <div className="muted small">
+              常规授权在入住时登记；临时探访需先授予临时授权并经产妇<b>确认</b>后方可排期发门禁。
+              探访前可撤回：<b>未入场家属门禁立即失效并通知前台</b>；若家属已入场，撤回将升级护士长现场协调。
+            </div>
+            <DataTable cols={["探访人", "关系", "类型", "状态", "操作"]} empty="暂无授权记录"
+              rows={authorizations.map((a) => [
+                <span key="n">{String(a.visitor_name)}</span>,
+                String(a.relation || "-"),
+                String(a.auth_type) === "temporary" ? "临时" : "常规",
+                <Badge key="s" text={AUTH_STATUS[String(a.status)] || String(a.status)} cls={badgeClass(String(a.status))} />,
+                String(a.status) === "pending" ? (
+                  <ActionButton key="ok" action="auths.confirm" payload={{ id: Number(a.id) }} label="产妇确认授权" kind="primary" />
+                ) : ["active", "revoking"].includes(String(a.status)) ? (
+                  <DataForm key="rv" compact action="auths.revoke" hidden={{ id: Number(a.id) }}
+                    fields={[{ name: "reason", label: "撤回原因", placeholder: "如：今日身体不适，暂不接待" }]}
+                    submitLabel={String(a.status) === "revoking" ? "查看(已升级护士长)" : "撤回授权"} />
+                ) : <span key="x" className="muted small">{String(a.revoke_reason || "-")}</span>,
+              ])} />
+            <details className="mt8">
+              <summary className="muted">为新探访人授予临时授权</summary>
+              <DataForm compact action="auths.grant" hidden={{ stayId }}
+                fields={[
+                  { name: "visitorName", label: "探访人姓名", required: true },
+                  { name: "relation", label: "与产妇关系", placeholder: "如：朋友 / 同事" },
+                  { name: "authType", label: "授权类型", type: "select", required: true, options: [{ value: "temporary", label: "临时授权（本次探访）" }, { value: "routine", label: "常规授权（长期）" }] },
+                ]} submitLabel="提交授权申请（待确认）" />
+            </details>
+        </Section>
+      )}
+
       <div className="grid cols-2">
         {showVisits && (
-          <Section title="探访预约">
+          <Section title="探访预约 / 门禁 / 闭环">
             <DataForm compact action="visits.create" hidden={{ stayId }}
               fields={[
                 { name: "visitorName", label: "探访人姓名", required: true },
@@ -108,15 +147,49 @@ export default async function FamilyPage() {
                 { name: "hours", label: "时长(小时)", type: "number", defaultValue: 2 },
                 { name: "isTemp", label: "临时增加探访", type: "checkbox" },
               ]} submitLabel="提交预约" />
+            <div className="muted small mt8">
+              同一时段申请人数超过房间容量时，前台将按授权关系、探访规则、容量与护理安排生成排队 / 拆分 / 改约方案；
+              爽约记录会影响后续同名人排队优先级（前台可依紧急照护或产妇书面确认覆盖）。
+            </div>
             <div className="mt8">
-              <DataTable cols={["探访人", "时间", "状态", "消毒"]} empty="暂无预约"
+              <DataTable cols={["探访人", "时间", "状态", "授权/健康/消毒", "实到/闭环"]} empty="暂无预约"
                 rows={visits.map((v) => [
-                  <span key="v">{String(v.visitor_name)}{Number(v.is_temp) ? <span className="badge amber">临时</span> : null}</span>,
-                  <span key="t" className="small">{dt(v.visit_time)}</span>,
+                  <span key="v">{String(v.visitor_name)}{Number(v.is_temp) ? <span className="badge amber">临时</span> : null}{Number(v.no_show) ? <span className="badge red">爽约</span> : null}</span>,
+                  <span key="t" className="small">{dt(v.visit_time)}~{dt(v.end_time)}</span>,
                   <Badge key="s" text={VISIT_STATUS[String(v.status)] || ""} cls={badgeClass(String(v.status))} />,
-                  Number(v.disinfected) ? <span key="d" className="badge green">已消毒</span> : <span key="nd" className="badge gray">待入所登记</span>,
+                  <span key="chk" className="small">
+                    {Number(v.authorized) ? <span className="badge green">授权</span> : <span className="badge red">无授权</span>}
+                    <span className={String(v.health_status) === "ok" ? "badge green" : "badge gray"}>{VISIT_HEALTH[String(v.health_status)] || "未核验"}</span>
+                    {Number(v.disinfected) ? <span className="badge green">已消毒</span> : <span className="badge gray">待消毒</span>}
+                    {v.override_reason ? <div className="muted small">覆盖：{String(v.override_reason)}</div> : null}
+                  </span>,
+                  <span key="c" className="small">实到 {Number(v.actual_count)} 人{v.closed_result ? ` · ${v.closed_result === "closed" ? "已闭环" : String(v.closed_result)}` : ""}</span>,
                 ])} />
             </div>
+            <div className="mt8">
+              <div className="muted small">我的门禁与进出记录：</div>
+              <DataTable cols={["门禁码", "探访人", "有效期", "状态"]} empty="暂未发放门禁"
+                rows={passes.map((p) => [
+                  <span key="c" className="small">{String(p.pass_code)}</span>,
+                  String(p.visitor_name),
+                  <span key="t" className="small">{dt(p.valid_from)}~{dt(p.valid_to)}</span>,
+                  <Badge key="s" text={PASS_STATUS[String(p.status)] || String(p.status)} cls={badgeClass(String(p.status))} />,
+                ])} />
+              <ul className="timeline mt8">
+                {passEvents.map((e) => (
+                  <li key={String(e.id)}>
+                    <span className="t-time">{dt(e.gate_time)}</span>
+                    <b>{String(e.visitor_name)}</b> {String(e.direction) === "in" ? "入场" : String(e.direction) === "out" ? "出场" : "门禁失效"}（{String(e.gate)}）
+                  </li>
+                ))}
+                {passEvents.length === 0 && <li className="muted small">暂无进出记录</li>}
+              </ul>
+            </div>
+            {myAvoidances.length > 0 && (
+              <div className="muted small mt8">
+                护理避让：{myAvoidances.map((a) => `${dt(a.window_start).slice(5)}-${dt(a.window_end).slice(11, 16)}${String(a.status) === "done" ? "（已避让）" : "（计划中）"}`).join("；")}
+              </div>
+            )}
           </Section>
         )}
 
